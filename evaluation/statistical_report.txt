@@ -1,0 +1,170 @@
+==============================================================================
+  STATISTICAL ANALYSIS REPORT
+  Deterministic Safety Filter (DSF) for 6G Digital Immunity
+  
+==============================================================================
+
+  Experimental Configuration:
+    Independent runs:  n = 10
+    Intents per run:  N = 500
+    Total intents:     5000
+    Adversarial frac:  30%
+    CBF gamma (k):     0.3
+    Lyapunov alpha:   0.1
+    Zeno tau_min:      500.0 ms
+
+  DSF Gates Active: All three (CUE Schema + CBF Safety + Zeno Guard)
+
+------------------------------------------------------------------------------
+  SECTION 1: DESCRIPTIVE STATISTICS
+------------------------------------------------------------------------------
+
+  Metric: Acceptance Rate (fraction)
+    N     = 10
+    Mean  = 0.004400
+    Std   = 0.002633
+    Min   = 0.000000
+    Max   = 0.008000
+    Median= 0.004000
+    Q1    = 0.002500
+    Q3    = 0.006000
+
+  Metric: Min Safety Margin $h(x)$ (dB / %)
+    N     = 10
+    Mean  = 1.221784
+    Std   = 0.124320
+    Min   = 1.032592
+    Max   = 1.446000
+    Median= 1.192301
+    Q1    = 1.145822
+    Q3    = 1.293133
+
+  Metric: DSF Latency (ms) (ms)
+    N     = 10
+    Mean  = 1.534195
+    Std   = 0.019859
+    Min   = 1.506622
+    Max   = 1.566464
+    Median= 1.534199
+    Q1    = 1.516454
+    Q3    = 1.547290
+
+  Metric: Zeno Violation Rate (fraction)
+    N     = 10
+    Mean  = 0.172800
+    Std   = 0.014180
+    Min   = 0.148000
+    Max   = 0.194000
+    Median= 0.175000
+    Q1    = 0.164500
+    Q3    = 0.179500
+
+------------------------------------------------------------------------------
+  SECTION 2: 95% CONFIDENCE INTERVALS (Student's t-distribution)
+------------------------------------------------------------------------------
+
+  Metric: Acceptance Rate
+    Mean       = 0.004400
+    Std Error  = 0.000833
+    t-critical = 2.2622 (df=9)
+    95% CI     = [0.002516, 0.006284]
+    CI width   = 0.003767
+
+  Metric: Min Safety Margin $h(x)$
+    Mean       = 1.221784
+    Std Error  = 0.039313
+    t-critical = 2.2622 (df=9)
+    95% CI     = [1.132851, 1.310717]
+    CI width   = 0.177866
+
+  Metric: DSF Latency (ms)
+    Mean       = 1.534195
+    Std Error  = 0.006280
+    t-critical = 2.2622 (df=9)
+    95% CI     = [1.519989, 1.548402]
+    CI width   = 0.028413
+
+  Metric: Zeno Violation Rate
+    Mean       = 0.172800
+    Std Error  = 0.004484
+    t-critical = 2.2622 (df=9)
+    95% CI     = [0.162656, 0.182944]
+    CI width   = 0.020287
+
+------------------------------------------------------------------------------
+  SECTION 3: SHAPIRO-WILK NORMALITY TEST
+  H0: Data is normally distributed. Reject H0 if p < 0.05.
+------------------------------------------------------------------------------
+
+  Metric: Acceptance Rate
+    W statistic = 0.941914
+    p-value     = 0.574505
+    Verdict     : NORMAL
+
+  Metric: Min Safety Margin $h(x)$
+    W statistic = 0.967068
+    p-value     = 0.862411
+    Verdict     : NORMAL
+
+  Metric: DSF Latency (ms)
+    W statistic = 0.962339
+    p-value     = 0.812178
+    Verdict     : NORMAL
+
+  Metric: Zeno Violation Rate
+    W statistic = 0.977659
+    p-value     = 0.951419
+    Verdict     : NORMAL
+
+------------------------------------------------------------------------------
+  SECTION 4: EFFECT SIZE (Cohen's d) — DSF vs Baseline
+------------------------------------------------------------------------------
+
+  Metric: Acceptance Rate
+    DSF mean      = 0.0044
+    Baseline mean = 1.0000
+    Cohen's d     = -534.7230
+    |d|           = 534.7230 (large)
+
+  Metric: Safety Violations
+    DSF mean      = 0.00
+    Baseline mean = 107.70
+    Cohen's d     = -33.6764
+    |d|           = 33.6764 (large)
+
+  Metric: DSF Latency
+    DSF mean      = 1.5342
+    Baseline mean = 0.0000
+    Cohen's d     = 109.2522
+    |d|           = 109.2522 (large)
+
+------------------------------------------------------------------------------
+  SECTION 5: WILCOXON SIGNED-RANK TEST (Paired, Non-Parametric)
+  H0: No difference between DSF and baseline. Reject H0 if p < 0.05.
+------------------------------------------------------------------------------
+
+  Metric: Acceptance Rate
+    W statistic = 0.0000
+    p-value     = 0.001953
+    Significant : YES
+
+  Metric: Safety Violations
+    W statistic = 0.0000
+    p-value     = 0.001953
+    Significant : YES
+
+------------------------------------------------------------------------------
+  SECTION 6: SUMMARY OF FINDINGS
+------------------------------------------------------------------------------
+
+  • DSF acceptance rate:    0.44%
+  • DSF safety violations:  0.0 per run
+  • Baseline violations:    107.7 per run
+  • Violation reduction:    100.0%
+  • Effect size (violations): Cohen's d = -33.68 (large)
+  • Average DSF latency:    1.53 ms
+  • Average safety margin:   1.22 (CBF barrier units)
+
+==============================================================================
+  End of Statistical Report
+==============================================================================

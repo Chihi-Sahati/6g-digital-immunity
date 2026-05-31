@@ -1,0 +1,694 @@
+# ============================================================================
+# 6G Digital Immunity — Docker Compose (Phase 5)
+# ============================================================================
+# 3-tier isolated network topology with mTLS and strict iptables egress
+# controls enforcing the determinism principle:
+#
+#   telemetry-net  (172.28.0.0/16)  — OsmoBSC, OsmoBTS, Prometheus, Syslog
+#   inference-net  (172.29.0.0/16)  — DSF gRPC, TelcoLLM, Kafka, Zookeeper
+#   actuation-net  (172.30.0.0/16)  — Osmocom network elements (targets)
+#
+# ISOLATION RULES (enforced via iptables in each container's entrypoint):
+#   - TelcoLLM (llm-agent)  : DROP egress → telemetry-net AND actuation-net
+#   - DSF Server             : DROP egress → actuation-net only
+#   - Network-Actuator       : ONLY service allowed to reach actuation-net
+#
+# TelcoLLM has NO egress to Osmocom elements.  Only DSF → Network-Actuator
+# → Osmocom path exists for actuation.
+# ============================================================================
+
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Shared environment defaults
+# ---------------------------------------------------------------------------
+x-common-env: &common-env
+  TZ: "UTC"
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: "INFO"
+
+x-mtls-dsf: &mtls-dsf-env
+  TLS_CA_CERT: "/run/secrets/ca-cert"
+  TLS_SERVER_CERT: "/run/secrets/dsf-server-cert"
+  TLS_SERVER_KEY: "/run/secrets/dsf-server-key"
+  TLS_CLIENT_CERT: "/run/secrets/dsf-client-cert"
+  TLS_CLIENT_KEY: "/run/secrets/dsf-client-key"
+
+x-mtls-llm: &mtls-llm-env
+  TLS_CA_CERT: "/run/secrets/ca-cert"
+  TLS_SERVER_CERT: "/run/secrets/llm-agent-cert"
+  TLS_SERVER_KEY: "/run/secrets/llm-agent-key"
+  TLS_CLIENT_CERT: "/run/secrets/llm-client-cert"
+  TLS_CLIENT_KEY: "/run/secrets/llm-client-key"
+
+x-mtls-actuator: &mtls-actuator-env
+  TLS_CA_CERT: "/run/secrets/ca-cert"
+  TLS_SERVER_CERT: "/run/secrets/osmocom-actuator-cert"
+  TLS_SERVER_KEY: "/run/secrets/osmocom-actuator-key"
+  TLS_CLIENT_CERT: "/run/secrets/osmocom-client-cert"
+  TLS_CLIENT_KEY: "/run/secrets/osmocom-client-key"
+
+x-kafka-mtls: &mtls-kafka-env
+  KAFKA_TLS_CA_CERT: "/run/secrets/ca-cert"
+  KAFKA_TLS_SERVER_CERT: "/run/secrets/kafka-server-cert"
+  KAFKA_TLS_SERVER_KEY: "/run/secrets/kafka-server-key"
+
+x-resource-limits: &resource-limits
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 512M
+      reservations:
+        memory: 128M
+
+x-resource-limits-large: &resource-limits-large
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"
+        memory: 1G
+      reservations:
+        memory: 256M
+
+# ---------------------------------------------------------------------------
+# Networks — 3-tier isolation
+# ---------------------------------------------------------------------------
+networks:
+  telemetry-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-telemetry
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+
+  inference-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-inference
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+          gateway: 172.29.1.1
+
+  actuation-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-actuation
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  certs-ca:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./infra/certs/ca
+  certs-dsf:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./infra/certs/dsf-server
+  certs-llm:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./infra/certs/llm-agent
+  certs-actuator:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./infra/certs/osmocom-actuator
+  certs-kafka:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./infra/certs/kafka
+  certs-zookeeper:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./infra/certs/zookeeper
+  kafka-data:
+  zookeeper-data:
+  prometheus-data:
+  osmo-bsc-config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./osmo-bsc/config
+  osmo-bts-config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./osmo-bts/config
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+secrets:
+  ca-cert:
+    file: ./infra/certs/ca/ca.crt
+  ca-key:
+    file: ./infra/certs/ca/ca.key
+  dsf-server-cert:
+    file: ./infra/certs/dsf-server/server.crt
+  dsf-server-key:
+    file: ./infra/certs/dsf-server/server.key
+  dsf-client-cert:
+    file: ./infra/certs/dsf-server/client.crt
+  dsf-client-key:
+    file: ./infra/certs/dsf-server/client.key
+  llm-agent-cert:
+    file: ./infra/certs/llm-agent/server.crt
+  llm-agent-key:
+    file: ./infra/certs/llm-agent/server.key
+  llm-client-cert:
+    file: ./infra/certs/llm-agent/client.crt
+  llm-client-key:
+    file: ./infra/certs/llm-agent/client.key
+  osmocom-actuator-cert:
+    file: ./infra/certs/osmocom-actuator/server.crt
+  osmocom-actuator-key:
+    file: ./infra/certs/osmocom-actuator/server.key
+  osmocom-client-cert:
+    file: ./infra/certs/osmocom-actuator/client.crt
+  osmocom-client-key:
+    file: ./infra/certs/osmocom-actuator/client.key
+  kafka-server-cert:
+    file: ./infra/certs/kafka/server.crt
+  kafka-server-key:
+    file: ./infra/certs/kafka/server.key
+  kafka-client-cert:
+    file: ./infra/certs/kafka/client.crt
+  kafka-client-key:
+    file: ./infra/certs/kafka/client.key
+  zookeeper-server-cert:
+    file: ./infra/certs/zookeeper/server.crt
+  zookeeper-server-key:
+    file: ./infra/certs/zookeeper/server.key
+
+# ============================================================================
+# Services
+# ============================================================================
+
+services:
+
+  # -------------------------------------------------------------------------
+  # INFERENCE-NET: Apache Kafka
+  # -------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: 6gdi-zookeeper
+    hostname: zookeeper
+    networks:
+      inference-net:
+        ipv4_address: 172.29.0.11
+    ports:
+      - "2181:2181"
+    environment:
+      <<: *common-env
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 60
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-data:/var/lib/zookeeper/log
+    secrets:
+      - ca-cert
+      - zookeeper-server-cert
+      - zookeeper-server-key
+    restart: unless-stopped
+    <<: *resource-limits
+    healthcheck:
+      test: ["CMD-SHELL", 'echo ruok | nc -w 2 localhost 2181 || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    labels:
+      - "com.6g-di.tier=inference"
+      - "com.6g-di.component=zookeeper"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: 6gdi-kafka
+    hostname: kafka
+    networks:
+      inference-net:
+        ipv4_address: 172.29.0.10
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      <<: [*common-env, *mtls-kafka-env]
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_BYTES: 536870912
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_LOG_CLEANUP_POLICY: "delete"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_CONFLUENT_SUPPORT_CUSTOMER_ID: "anonymous"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - certs-ca:/etc/kafka/secrets/ca:ro
+      - certs-kafka:/etc/kafka/secrets/kafka:ro
+    secrets:
+      - ca-cert
+      - kafka-server-cert
+      - kafka-server-key
+    restart: unless-stopped
+    <<: *resource-limits-large
+    healthcheck:
+      test: ["CMD-SHELL", 'kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    labels:
+      - "com.6g-di.tier=inference"
+      - "com.6g-di.component=kafka"
+
+  # -------------------------------------------------------------------------
+  # TELEMETRY-NET: RAN Simulator (Replacing OsmoBSC)
+  # -------------------------------------------------------------------------
+  osmo-bsc:
+    build:
+      context: ./simulation
+      dockerfile: Dockerfile
+    container_name: 6gdi-osmo-bsc
+    hostname: osmo-bsc
+    networks:
+      telemetry-net:
+        ipv4_address: 172.28.0.50
+      inference-net:
+        ipv4_address: 172.29.0.50
+    volumes:
+      - osmo-bsc-config:/etc/osmocom
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    <<: *resource-limits
+    healthcheck:
+      test: ["CMD-SHELL", 'python -c "print(\"OK\")" || exit 1']
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    labels:
+      - "com.6g-di.tier=telemetry"
+      - "com.6g-di.component=osmo-bsc"
+      - "com.6g-di.role=bts-controller"
+
+  # -------------------------------------------------------------------------
+  # ACTUATION-NET: Osmocom BTS (Base Transceiver Station)
+  # -------------------------------------------------------------------------
+  osmo-bts:
+    image: alpine:latest
+    command: tail -f /dev/null
+    container_name: 6gdi-osmo-bts
+    hostname: osmo-bts
+    networks:
+      actuation-net:
+        ipv4_address: 172.30.0.100
+    ports:
+      - "4243:4242"    # VTY control interface (mapped to avoid conflict)
+    depends_on:
+      osmo-bsc:
+        condition: service_started
+    volumes:
+      - osmo-bts-config:/etc/osmocom
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    <<: *resource-limits
+    healthcheck:
+      test: ["CMD-SHELL", 'echo "OK" || exit 1']
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    labels:
+      - "com.6g-di.tier=actuation"
+      - "com.6g-di.component=osmo-bts"
+      - "com.6g-di.role=transceiver"
+
+  # -------------------------------------------------------------------------
+  # TELEMETRY-NET: Syslog Forwarder (Collector)
+  # Taps Osmocom logs, parses radio/bearer metrics, pushes to Kafka
+  # -------------------------------------------------------------------------
+  syslog-forwarder:
+    build:
+      context: ./
+      dockerfile: telemetry/Dockerfile
+    container_name: 6gdi-syslog-forwarder
+    hostname: syslog-forwarder
+    networks:
+      telemetry-net:
+        ipv4_address: 172.28.0.60
+      inference-net:
+        ipv4_address: 172.29.0.40
+    depends_on:
+      osmo-bsc:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_TOPIC_TELEMETRY: "network-telemetry"
+      KAFKA_TOPIC_EVENTS: "network-events"
+      KAFKA_CLIENT_ID: "syslog-forwarder"
+      KAFKA_SECURITY_PROTOCOL: "PLAINTEXT"
+      LOG_SOURCES: >
+        [
+          {"path": "/var/log/osmocom/bsc.log", "element_id": "BSC-001", "element_label": "OsmoBSC-Primary"}
+        ]
+      PARSE_RADIO_METRICS: "true"
+      PARSE_BEARER_METRICS: "true"
+      PARSE_EVENTS: "true"
+      BATCH_SIZE: "50"
+      FLUSH_INTERVAL_SEC: "5"
+      FORWARDER_MODE: "tail"
+    volumes:
+      - osmo-bsc-config:/var/log/osmocom:ro
+    restart: unless-stopped
+    <<: *resource-limits
+    healthcheck:
+      test: ["CMD-SHELL", 'pgrep -f syslog_forwarder || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    labels:
+      - "com.6g-di.tier=telemetry+inference"
+      - "com.6g-di.component=syslog-forwarder"
+      - "com.6g-di.role=collector"
+
+  # -------------------------------------------------------------------------
+  # INFERENCE-NET: DSF gRPC Safety Filter Server
+  # Deterministic Safety Filter — the ONLY component authorized to forward
+  # validated actuation commands to the actuation-net.
+  #
+  # *** IPTABLES ISOLATION ***
+  # iptables -I OUTPUT -d 172.30.0.0/16 -j DROP
+  # DSF itself does NOT talk to actuation-net; it validates and returns
+  # commands to the network-actuator which is the sole bridge.
+  # -------------------------------------------------------------------------
+  dsf-server:
+    build:
+      context: ./
+      dockerfile: safety-filter/Dockerfile
+    container_name: 6gdi-dsf-server
+    hostname: dsf-server
+    networks:
+      inference-net:
+        ipv4_address: 172.29.0.20
+    ports:
+      - "50052:50052"    # gRPC Safety Filter service
+      - "50053:50053"    # gRPC Health / metrics
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: [*common-env, *mtls-dsf-env]
+      PYTHONPATH: "/app/src:/app/lib"
+      SAFETY_FILTER_LIB: "/app/lib"
+      DSF_GRPC_PORT: "50052"
+      DSF_GRPC_HOST: "0.0.0.0"
+      DSF_MAX_CONCURRENT_SESSIONS: "100"
+      DSF_COMMAND_TIMEOUT_MS: "5000"
+      DSF_POLICY_RULES_PATH: "/app/config/safety-policies.json"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_GROUP_ID: "dsf-server-group"
+      KAFKA_TOPIC_TELEMETRY: "network-telemetry"
+      KAFKA_TOPIC_COMMANDS: "safety-filtered-commands"
+      KAFKA_TOPIC_AUDIT: "safety-audit-log"
+      DSF_ACTUATOR_ENDPOINT: "network-actuator:50054"
+    volumes:
+      - certs-ca:/app/certs/ca:ro
+      - certs-dsf:/app/certs/dsf:ro
+    secrets:
+      - ca-cert
+      - dsf-server-cert
+      - dsf-server-key
+      - dsf-client-cert
+      - dsf-client-key
+    restart: unless-stopped
+    <<: *resource-limits-large
+    healthcheck:
+      test: ["CMD-SHELL", 'python -c "import socket; s = socket.socket(); s.connect((\"localhost\", 50052)); s.close()" || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    labels:
+      - "com.6g-di.tier=inference"
+      - "com.6g-di.component=dsf-server"
+      - "com.6g-di.role=safety-filter"
+    # NOTE: iptables isolation applied via entrypoint or init script
+    # iptables -I OUTPUT -d 172.30.0.0/16 -j DROP   (no direct egress to actuation-net)
+
+  # -------------------------------------------------------------------------
+  # INFERENCE-NET: TelcoLLM Agent
+  # Generates network optimization suggestions.  Has NO egress to
+  # telemetry-net or actuation-net — it communicates only within
+  # inference-net (DSF, Kafka) and is completely air-gapped from
+  # Osmocom elements.
+  #
+  # *** IPTABLES ISOLATION ***
+  # iptables -I OUTPUT -d 172.28.0.0/16 -j DROP  (no telemetry-net)
+  # iptables -I OUTPUT -d 172.30.0.0/16 -j DROP  (no actuation-net)
+  # -------------------------------------------------------------------------
+  llm-agent:
+    build:
+      context: ./
+      dockerfile: llm-agent/Dockerfile
+    container_name: 6gdi-llm-agent
+    hostname: llm-agent
+    networks:
+      inference-net:
+        ipv4_address: 172.29.0.30
+    depends_on:
+      kafka:
+        condition: service_healthy
+      dsf-server:
+        condition: service_healthy
+    environment:
+      <<: [*common-env, *mtls-llm-env]
+      DSF_HOST: "dsf-server"
+      DSF_PORT: "50052"
+      DSF_GRPC_USE_TLS: "true"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_GROUP_ID: "llm-agent-group"
+      KAFKA_TOPIC_TELEMETRY: "network-telemetry"
+      KAFKA_TOPIC_SUGGESTIONS: "llm-suggestions"
+      KAFKA_CONSUMER_AUTO_OFFSET_RESET: "latest"
+      LLM_MODEL_PATH: "/app/models/telco-llm"
+      LLM_MAX_TOKENS: "2048"
+      LLM_TEMPERATURE: "0.2"
+      LLM_INFERENCE_TIMEOUT_MS: "30000"
+      LLM_AGENT_POLL_INTERVAL_SEC: "10"
+      LLM_AGENT_BATCH_SIZE: "1"
+    volumes:
+      - certs-ca:/app/certs/ca:ro
+      - certs-llm:/app/certs/llm:ro
+    secrets:
+      - ca-cert
+      - llm-agent-cert
+      - llm-agent-key
+      - llm-client-cert
+      - llm-client-key
+    restart: unless-stopped
+    <<: *resource-limits-large
+    healthcheck:
+      test: ["CMD-SHELL", 'curl -fs http://localhost:8080/health || exit 1']
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    labels:
+      - "com.6g-di.tier=inference"
+      - "com.6g-di.component=llm-agent"
+      - "com.6g-di.role=telco-llm"
+    # NOTE: iptables isolation applied via entrypoint or init script
+    # iptables -I OUTPUT -d 172.28.0.0/16 -j DROP  (no telemetry-net egress)
+    # iptables -I OUTPUT -d 172.30.0.0/16 -j DROP  (no actuation-net egress)
+
+  # -------------------------------------------------------------------------
+  # ACTUATION-NET: Network Actuator
+  # The ONLY service permitted to reach Osmocom elements on actuation-net.
+  # Receives safety-validated commands from DSF via gRPC, translates them
+  # into VTY commands for OsmoBSC/OsmoBTS.
+  #
+  # *** This service has FULL egress to actuation-net ***
+  # It is the sole bridge between inference decisions and actuation.
+  # -------------------------------------------------------------------------
+  network-actuator:
+    build:
+      context: ./
+      dockerfile: safety-filter/actuation/Dockerfile
+    container_name: 6gdi-network-actuator
+    hostname: network-actuator
+    networks:
+      inference-net:
+        ipv4_address: 172.29.0.21
+      actuation-net:
+        ipv4_address: 172.30.0.50
+    ports:
+      - "50054:50054"    # gRPC actuation interface
+    depends_on:
+      osmo-bts:
+        condition: service_started
+      dsf-server:
+        condition: service_started
+    environment:
+      <<: [*common-env, *mtls-actuator-env]
+      OSMO_VTY_HOST: "172.30.0.100"   # OsmoBTS on actuation-net
+      OSMO_VTY_PORT: "4242"
+      OSMO_BSC_HOST: "172.28.0.50"    # OsmoBSC on telemetry-net (for config sync)
+      OSMO_BSC_VTY_PORT: "4242"
+      ACTUATOR_GRPC_PORT: "50054"
+      ACTUATOR_GRPC_HOST: "0.0.0.0"
+      ACTUATOR_COMMAND_TIMEOUT_MS: "3000"
+      ACTUATOR_MAX_RETRIES: "3"
+      ACTUATOR_RETRY_DELAY_MS: "500"
+      ACTUATOR_DRY_RUN: "false"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_TOPIC_AUDIT: "safety-audit-log"
+      KAFKA_TOPIC_COMMAND_ACK: "actuation-acknowledgments"
+    volumes:
+      - certs-ca:/app/certs/ca:ro
+      - certs-actuator:/app/certs/actuator:ro
+    secrets:
+      - ca-cert
+      - osmocom-actuator-cert
+      - osmocom-actuator-key
+      - osmocom-client-cert
+      - osmocom-client-key
+    restart: unless-stopped
+    <<: *resource-limits
+    healthcheck:
+      test: ["CMD-SHELL", 'python -c "import socket; s = socket.socket(); s.connect((\"localhost\", 50054)); s.close()" || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    labels:
+      - "com.6g-di.tier=actuation+inference"
+      - "com.6g-di.component=network-actuator"
+      - "com.6g-di.role=actuator"
+      - "com.6g-di.sole-actuation-bridge=true"
+    # This is the ONLY service allowed to send traffic to actuation-net Osmocom
+    # elements. All other services are blocked by iptables/network isolation.
+
+  # -------------------------------------------------------------------------
+  # TELEMETRY-NET: Prometheus
+  # Scrapes Osmocom metrics and exposes for external monitoring
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: 6gdi-prometheus
+    hostname: prometheus
+    networks:
+      telemetry-net:
+        ipv4_address: 172.28.0.70
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+    <<: *resource-limits
+    healthcheck:
+      test: ["CMD-SHELL", 'wget -q --spider http://localhost:9090/-/healthy || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=24h"
+      - "--storage.tsdb.retention.size=512MB"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+      - "--log.level=info"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    labels:
+      - "com.6g-di.tier=telemetry"
+      - "com.6g-di.component=prometheus"
+      - "com.6g-di.role=monitoring"

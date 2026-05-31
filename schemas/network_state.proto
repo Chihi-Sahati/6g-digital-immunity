@@ -1,0 +1,329 @@
+// ============================================================================
+// network_state.proto — Deterministic Digital Immunity for 6G Networks
+// Phase 1: Telemetry Schema for Osmocom SDN-Controlled RAN
+// ============================================================================
+//
+// Defines the canonical protobuf3 schema for real-time network element
+// telemetry ingestion. Every Osmocom-managed gNB, eNB, BSC, and core
+// element publishes NetworkState messages at a configurable sampling
+// interval. The schema captures radio metrics, bearer QoS snapshots,
+// resource utilisation, and safety-barrier violation alerts.
+//
+// Protocol version: v1
+// Compatibility:   proto3 only (no proto2 features)
+// ============================================================================
+
+syntax = "proto3";
+
+package telecomm.schemas.v1;
+
+// ---------------------------------------------------------------------------
+// Google well-known types for temporal metadata
+// ---------------------------------------------------------------------------
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+// Operational state of a network element (gNB, eNB, BSC, AMF, SMF, …).
+// Mirrors 3GPP TS 28.541 ManagedElement lifecycle states extended with
+// DEGRADED and RECOVERING for digital-immunity feedback loops.
+enum ElementState {
+  ELEMENT_STATE_UNSPECIFIED = 0;   // Sentinel — must never appear on-wire
+  ACTIVE       = 1;                 // Normal operation, all KPIs within SLA
+  DEGRADED     = 2;                 // Partially impaired; CBF warnings active
+  RECOVERING   = 3;                 // Auto-healing in progress
+  FAULTED      = 4;                 // Hard failure; manual intervention needed
+  MAINTENANCE  = 5;                 // Planned downtime / software upgrade
+}
+
+// Radio access technology currently served by the element.
+// Extended beyond 3GPP to include 6G sub-THz bands (220–330 GHz).
+enum RadioAccessMode {
+  RADIO_ACCESS_MODE_UNSPECIFIED = 0;
+  FIVE_G_NR_SA      = 1;           // 5G NR Stand-Alone
+  FIVE_G_NR_NSA     = 2;           // 5G NR Non-Stand-Alone (LTE anchor)
+  FOUR_G_LTE        = 3;           // E-UTRAN LTE
+  THREE_G_UTRAN     = 4;           // UTRAN UMTS / HSPA
+  TWO_G_GERAN       = 5;           // GERAN GSM / EDGE
+  SIX_G_SUB_THZ     = 6;           // 6G sub-terahertz (220–330 GHz)
+}
+
+// 3GPP QoS Identifier. Covers standardised QCI values 1–9 (GPRS/LTE)
+// and 5QI values 65–86 (NR). Refer to TS 23.501 §5.7.3.
+enum QosIdentifier {
+  QOS_IDENTIFIER_UNSPECIFIED = 0;
+
+  // 4G LTE QCI (3GPP TS 23.203)
+  QCI_1  = 1;   // Conversational voice
+  QCI_2  = 2;   // Conversational video (live streaming)
+  QCI_3  = 3;   // Real-time gaming
+  QCI_4  = 4;   // Non-conversational video (buffered streaming)
+  QCI_5  = 5;   // IMS signalling
+  QCI_6  = 6;   // Video (buffered streaming), TCP-based
+  QCI_7  = 7;   // Voice, video, interactive gaming
+  QCI_8  = 8;   // Video (buffered streaming), TCP-based
+  QCI_9  = 9;   // MBB / best-effort data
+
+  // 5G NR 5QI (3GPP TS 23.501)
+  QOS_5QI_65  = 65;  // Mission-critical voice (CBRS)
+  QOS_5QI_66  = 66;  // Non-mission-critical voice
+  QOS_5QI_67  = 67;  // Mission-critical video (UAV C2)
+  QOS_5QI_68  = 68;  // Non-mission-critical video
+  QOS_5QI_69  = 69;  // Mission-critical data
+  QOS_5QI_70  = 70;  // Non-mission-critical data
+  QOS_5QI_71  = 71;  // Delay-sensitive signalling
+  QOS_5QI_72  = 72;  // Delay-sensitive data (AR/VR)
+  QOS_5QI_73  = 73;  // Video CBR (uplink)
+  QOS_5QI_74  = 74;  // Video CBR (downlink)
+  QOS_5QI_75  = 75;  // Low-latency AR/VR (uplink)
+  QOS_5QI_76  = 76;  // Low-latency AR/VR (downlink)
+  QOS_5QI_77  = 77;  // CBR MCS 5 table, uplink
+  QOS_5QI_78  = 78;  // CBR MCS 5 table, downlink
+  QOS_5QI_79  = 79;  // DetNet / TSN integrated
+  QOS_5QI_80  = 80;  // Low-latency eMBB
+  QOS_5QI_81  = 81;  // Semi-persistent scheduling
+  QOS_5QI_82  = 82;  // Broadcast/Multicast (NR MBS)
+  QOS_5QI_83  = 83;  // V2X broadcast (PC5)
+  QOS_5QI_84  = 84;  // V2X unicast (PC5)
+  QOS_5QI_85  = 85;  // DetNet deterministic
+  QOS_5QI_86  = 86;  // 6G URLLC sub-THz
+}
+
+// Severity classification for safety alerts raised by the DSF.
+enum AlertSeverity {
+  ALERT_SEVERITY_UNSPECIFIED = 0;
+  LOW    = 1;   // Barrier margin thinning; advisory only
+  MEDIUM = 2;   // Barrier violated but Lyapunov still stable
+  HIGH   = 3;   // Lyapunov violation imminent; QoS degradation
+  CRITICAL = 4; // Zeno detected or multi-barrier cascade
+}
+
+// ============================================================================
+// Sub-messages: Radio, Bearer, Resource Metrics
+// ============================================================================
+
+// Radio-frequency measurements from the RAN element.
+// All dB values use the 3GPP convention (e.g., RSRP is negative for
+// usable signals, typically −44 dBm to −140 dBm).
+message RadioMetrics {
+  // Reference Signal Received Power (dBm). Negative for valid signals.
+  double rsrp_dbm               = 1;
+  // Reference Signal Received Quality (dB). Range: −20 to −3.
+  double rsrq_db                = 2;
+  // Signal-to-Interference-plus-Noise Ratio (dB).
+  double sinr_db                = 3;
+  // Current transmit power (dBm). Typical gNB: 43 dBm (20 W).
+  double tx_power_dbm           = 4;
+  // Carrier centre frequency (Hz). e.g., 3620.0e6 for n78.
+  double carrier_freq_hz        = 5;
+  // Channel bandwidth (Hz). NR: 5–100 MHz; LTE: 1.4–20 MHz.
+  double bandwidth_hz           = 6;
+  // Physical Resource Block utilisation [0.0, 1.0].
+  double prb_utilisation        = 7;
+}
+
+// Per-bearer QoS and performance metrics.
+message BearerMetrics {
+  // Downlink aggregate throughput (bits/s).
+  uint64 dl_throughput_bps      = 1;
+  // Uplink aggregate throughput (bits/s).
+  uint64 ul_throughput_bps      = 2;
+  // Round-trip time (ms).
+  double rtt_ms                 = 3;
+  // Packet loss rate [0.0, 1.0].
+  double packet_loss_rate       = 4;
+  // Jitter (ms).
+  double jitter_ms              = 5;
+  // Number of active EPS/PDU sessions / bearers.
+  uint32 active_bearers         = 6;
+}
+
+// Compute-platform resource utilisation of the element.
+message ResourceMetrics {
+  // CPU utilisation [0.0, 1.0].
+  double cpu_utilisation        = 1;
+  // Memory utilisation [0.0, 1.0].
+  double memory_utilisation     = 2;
+  // Storage utilisation [0.0, 1.0].
+  double storage_utilisation    = 3;
+  // Board temperature (°C).
+  double temperature_celsius    = 4;
+  // Active GTP-U tunnels (downlink + uplink).
+  uint32 gtpu_tunnels           = 5;
+  // Element uptime (seconds since last boot).
+  uint64 uptime_s               = 6;
+}
+
+// ============================================================================
+// QoS Snapshot — per-flow or per-5QI observability
+// ============================================================================
+
+// Measured QoS for a single flow or QCI/5QI class.
+message QosSnapshot {
+  QosIdentifier qos_id              = 1;
+  // Number of active flows matching this QoS class.
+  uint32 active_flows                = 2;
+  // Guaranteed Bit Rate (bits/s).
+  uint64 gbr_bps                     = 3;
+  // Maximum Bit Rate (bits/s).
+  uint64 mbr_bps                     = 4;
+  // 3GPP packet delay budget (ms).
+  uint32 packet_delay_budget_ms      = 5;
+  // Measured average one-way delay (ms).
+  double measured_avg_delay_ms       = 6;
+}
+
+// ============================================================================
+// Safety Alert sub-messages
+// ============================================================================
+
+// CBF (Control Barrier Function) violation detail.
+// Raised when h(x) < 0 or the extended class constraint is not met.
+message CbfViolation {
+  string barrier_id              = 1;
+  // Current barrier function value h(x).
+  double cbf_value               = 2;
+  // Class-K function value γ(h(x)) at the violation point.
+  double gamma_value             = 3;
+  // Safety margin computed by the DSF.
+  double margin                  = 4;
+}
+
+// Lyapunov stability violation detail.
+// Raised when V̇(x) > −α·V(x).
+message LyapunovViolation {
+  // dV/dt evaluated at the current state + control.
+  double v_dot                   = 1;
+  // Stability threshold: −α·V(x).
+  double alpha_v                 = 2;
+  // Current Lyapunov function value V(x).
+  double v_value                 = 3;
+  // Decay rate constant α.
+  double alpha                   = 4;
+}
+
+// Zeno behaviour violation detail.
+// Raised when inter-actuation time Δt < τ_min.
+message ZenoViolation {
+  // Time elapsed since last actuation (ms).
+  double delta_t_ms              = 1;
+  // Minimum permitted inter-actuation interval (ms).
+  double tau_min_ms              = 2;
+  // Number of rapid successive actuations in the observation window.
+  uint32 burst_count             = 3;
+}
+
+// Composite safety alert carrying zero or more violation sub-messages.
+// A single alert may contain multiple violation types when a cascade
+// is detected (CBF → Lyapunov → Zeno).
+message SafetyAlert {
+  // Unique alert identifier (UUID-v4 recommended).
+  string alert_id                = 1;
+  // Element that triggered the alert.
+  string element_id              = 2;
+  AlertSeverity severity         = 3;
+  // Monotonic timestamp when the alert was raised.
+  google.protobuf.Timestamp raised_at = 4;
+
+  // Violation details — at least one will be populated.
+  repeated CbfViolation     cbf_violations        = 5;
+  repeated LyapunovViolation lyapunov_violations   = 6;
+  repeated ZenoViolation    zeno_violations        = 7;
+
+  // Human-readable explanation generated by the DSF.
+  string description             = 8;
+  // Suggested remediation from the DSF (may be empty).
+  string remediation_hint       = 9;
+}
+
+// ============================================================================
+// Top-level NetworkState message
+// ============================================================================
+
+// Canonical telemetry point published by every managed network element.
+// This message is the single source of truth for DSF decision-making.
+message NetworkState {
+  // Globally unique element identifier (e.g., "gNB-DUS-001").
+  string element_id             = 1;
+  // Human-readable label (e.g., "Duesseldorf Macro Site 1").
+  string element_label           = 2;
+  // Current operational state.
+  ElementState state             = 3;
+  // Active radio access technology.
+  RadioAccessMode access_mode    = 4;
+  // Monotonically increasing sequence number for ordering.
+  uint64 sequence_number         = 5;
+  // Measurement timestamp (wall-clock).
+  google.protobuf.Timestamp measured_at = 6;
+  // Configured sampling interval.
+  google.protobuf.Duration sampling_interval = 7;
+
+  // Metric sub-messages (optional — may be absent in HEARTBEAT mode).
+  RadioMetrics    radio         = 10;
+  BearerMetrics   bearer        = 11;
+  ResourceMetrics resources     = 12;
+
+  // Per-QoS-class snapshots (may be empty).
+  repeated QosSnapshot qos_snapshots = 20;
+
+  // Active safety alerts (zero or more).
+  repeated SafetyAlert alerts    = 30;
+}
+
+// ============================================================================
+// Telemetry Ingest Service (gRPC)
+// ============================================================================
+
+// The TelemetryIngest service provides two RPC patterns:
+//   1. PushStateStream — server-side streaming for high-frequency elements
+//      (gNB sampling at 10 ms, 6G sub-THz at 1 ms).
+//   2. PushStateBatch — unary RPC for bulk/batched uploads from elements
+//      or from collectors aggregating multiple elements.
+//
+// The DSF subscribes to the streaming RPC and evaluates CBF/Lyapunov/Zeno
+// constraints in real time against each incoming NetworkState.
+service TelemetryIngest {
+
+  // Client-streaming RPC: the element pushes a continuous stream of
+  // NetworkState messages. The server returns an Acknowledgement for
+  // each message (or a batch acknowledgement for throughput).
+  //
+  // Flow control: the server may delay ACKs to apply back-pressure.
+  rpc PushStateStream(stream NetworkState) returns (stream IngestAck);
+
+  // Unary RPC: the client sends a batch of telemetry points and receives
+  // a single aggregated acknowledgement. Ideal for collector agents
+  // and periodic bulk uploads.
+  rpc PushStateBatch(NetworkStateBatch) returns (IngestAck);
+}
+
+// Acknowledgement returned for ingested telemetry.
+message IngestAck {
+  // True if all messages in the batch/stream were processed successfully.
+  bool success                  = 1;
+  // Number of state messages accepted in this ACK.
+  uint64 accepted_count         = 2;
+  // Number of state messages rejected (e.g., out-of-order, stale).
+  uint64 rejected_count         = 3;
+  // Highest sequence number acknowledged.
+  uint64 last_sequence_number   = 4;
+  // Server-side processing timestamp.
+  google.protobuf.Timestamp acked_at = 5;
+  // Human-readable error message (populated on partial failure).
+  string error_message          = 6;
+}
+
+// Batch container for bulk telemetry upload.
+message NetworkStateBatch {
+  // Batch identifier for correlation.
+  string batch_id               = 1;
+  // Source element or collector that produced this batch.
+  string source_id              = 2;
+  // Ordered list of NetworkState messages.
+  repeated NetworkState states  = 3;
+  // Batch generation timestamp.
+  google.protobuf.Timestamp generated_at = 4;
+}

@@ -1,0 +1,4 @@
+# C++ Build Dependencies (for safety-filter/core)
+eigen3>=3.4.0
+pybind11>=2.11.0
+cmake>=3.21

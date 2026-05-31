@@ -1,0 +1,340 @@
+// ============================================================================
+// llm_intent.proto — Deterministic Digital Immunity for 6G Networks
+// Phase 1: Intent Contract between TelcoLLM and DSF (Decision Safety Filter)
+// ============================================================================
+//
+// Defines the canonical protobuf3 schema for LLM-generated network intents.
+// The TelcoLLM produces NetworkIntent messages encoding desired RAN/Core/
+// Transport/Security configuration changes. Every intent MUST pass through
+// the IntentValidationService before any Osmocom command is issued.
+//
+// The validation pipeline checks:
+//   1. CBF (Control Barrier Function) safety constraints
+//   2. Lyapunov stability guarantees
+//   3. Zeno temporal guards (minimum inter-actuation time)
+//   4. Cue-based structural schema validation
+//
+// Protocol version: v1
+// ============================================================================
+
+syntax = "proto3";
+
+package telecomm.intent.v1;
+
+// ---------------------------------------------------------------------------
+// Google well-known types
+// ---------------------------------------------------------------------------
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+// High-level category of the LLM-generated intent. Maps to a SON/ANI
+// self-management function per 3GPP TS 28.532.
+enum IntentCategory {
+  INTENT_CATEGORY_UNSPECIFIED = 0;
+
+  SELF_HEALING          = 1;   // Fault detection → automated recovery
+  CAPACITY_ADJUSTMENT   = 2;   // Scale PRB, carriers, or UE sessions
+  HANDOVER_OPTIMISATION = 3;   // Tune HO hysteresis, TTT, offsets
+  LOAD_BALANCING        = 4;   // Redistribute UEs across cells/carriers
+  QOS_RECONFIGURATION   = 5;   // Modify QCI/5QI, bearers, slicing
+  SLA_GUARANTEE         = 6;   // Ensure contractual KPI compliance
+  EMERGENCY             = 7;   // Public safety / mission-critical override
+  MIGRATION             = 8;   // Planned element or slice migration
+}
+
+// DSF verdict on a submitted intent. Determines whether the intent
+// may be applied, denied, rate-limited, amended, or deferred.
+enum VerdictDecision {
+  VERDICT_DECISION_UNSPECIFIED = 0;
+
+  ALLOW       = 1;   // Intent passes all safety checks; apply immediately
+  DENY        = 2;   // Intent would violate safety invariants; reject
+  RATE_LIMIT  = 3;   // Intent is safe but too frequent; slow down
+  AMEND       = 4;   // Intent is partially unsafe; apply safe subset
+  DEFER       = 5;   // Intent is conditionally safe; queue for later
+}
+
+// UPF (User Plane Function) allocation strategy for PDU session
+// establishment under network slicing.
+enum UpfAllocationStrategy {
+  UPF_ALLOCATION_STRATEGY_UNSPECIFIED = 0;
+
+  ROUND_ROBIN   = 1;   // Distribute sessions across UPFs equally
+  LEAST_LOADED  = 2;   // Pick UPF with lowest CPU/memory utilisation
+  GEO_NEAREST   = 3;   // Minimise UE-to-UPF latency by geography
+  SLICE_AWARE   = 4;   // Select UPF matching slice Sst/Sd capability
+}
+
+// ============================================================================
+// Reasoning Trace — LLM chain-of-thought
+// ============================================================================
+
+// A single step in the LLM's reasoning trace. Stored for auditability
+// and post-hoc explainability.
+message ReasoningStep {
+  uint32 step_index              = 1;
+  string description             = 2;
+  // Structured data produced at this reasoning step
+  // (e.g., "observed rsrp = −95 dBm").
+  google.protobuf.Struct evidence = 3;
+  // Confidence at this step [0.0, 1.0].
+  double step_confidence        = 4;
+}
+
+// ============================================================================
+// Sub-intent Messages: Radio, Core, Transport, Security
+// ============================================================================
+
+// Radio-access-specific intent parameters. Applies to gNB, eNB, OsmoBTS.
+message RadioIntent {
+  // Target downlink transmit power (dBm). Typical: 43 dBm.
+  optional double tx_power_dbm                = 1;
+  // Reference signal power offset (dB).
+  optional double rs_power_offset_db          = 2;
+  // Cell reselection offset for neighbour cells (dB).
+  optional double cell_reselection_offset_db  = 3;
+  // Handover hysteresis margin (dB). Typical: 2–6 dB.
+  optional double ho_hysteresis_db            = 4;
+  // Time-to-trigger for handover (ms). Typical: 256–1024 ms.
+  optional uint32 time_to_trigger_ms           = 5;
+  // Target carrier frequency for inter-frequency HO (Hz).
+  optional double target_carrier_freq_hz      = 6;
+  // Number of MIMO spatial layers. Range: 1–8 (4×4 MIMO typical).
+  optional uint32 mimo_layers                 = 7;
+  // Maximum UE RRC connections. Range: 1–65536.
+  optional uint32 max_ue_connections          = 8;
+}
+
+// Core-network-specific intent parameters. Applies to AMF, SMF, UPF.
+message CoreIntent {
+  // Maximum UE sessions (PDU + EPS). Range: 1–1,000,000.
+  optional uint32 max_ue_sessions             = 1;
+  // Session timeout in seconds. Typical: 3600.
+  optional uint32 session_timeout_s           = 2;
+  // Public Land Mobile Network identifier (e.g., "26201").
+  optional string plmn_id                     = 3;
+  // Tracking Area Code. Hex string, 4–8 digits.
+  optional string tac                         = 4;
+  // Slice descriptors to activate or modify.
+  repeated SliceDescriptor slices             = 5;
+}
+
+// Transport-layer intent parameters. Applies to GTP-U, S1-U, N3/N4/N6.
+message TransportIntent {
+  // Maximum GTP-U tunnels across the transport plane.
+  optional uint32 max_gtpu_tunnels           = 1;
+  // Default Maximum Bit Rate for aggregate transport (bps).
+  optional uint64 default_mbr_bps             = 2;
+}
+
+// Security-layer intent parameters. Applies to NAS security, NEA/NIA.
+message SecurityIntent {
+  // Force re-authentication of all UEs on this element.
+  optional bool force_reauth                 = 1;
+  // NEA (Encryption Algorithm) priority list.
+  // Values: 0=NEA0 (no encryption), 1=NEA1 (128-NNN), 2=NEA2 (128-SNOW),
+  //         3=NEA3 (128-AES).
+  repeated int32 nea_priority                = 2;
+  // NIA (Integrity Protection Algorithm) priority list.
+  // Values: 0=NIA0 (no integrity), 1=NIA1 (128-NNN), 2=NIA2 (128-SNOW),
+  //         3=NIA3 (128-AES).
+  repeated int32 nia_priority                = 3;
+  // Enable emergency services (bypasses normal auth for PSAP).
+  optional bool emergency_services_enabled   = 4;
+}
+
+// Network slice descriptor. Conforms to 3GPP TS 23.503.
+message SliceDescriptor {
+  // Slice/Service Type. Range: 1–255.
+  // Standard: 1=eMBB, 2=URLLC, 3=mMTC, 4=V2X, 5=HN, 6=IIoT,
+  //          8=PM, 9=BI, 128=TSN, 255=default.
+  uint32 sst                          = 1;
+  // Slice Differentiator (6-digit hex string).
+  string sd                           = 2;
+  // Maximum UEs allowed in this slice.
+  uint32 max_ues                      = 3;
+  // Guaranteed Bit Rate per-UE (bps).
+  uint64 guaranteed_br_bps            = 4;
+  // Slice priority (0 = highest). Range: 0–255.
+  uint32 priority                     = 5;
+}
+
+// ============================================================================
+// Top-level NetworkIntent message
+// ============================================================================
+
+// Canonical intent message produced by the TelcoLLM. Carries the LLM's
+// requested network reconfiguration along with the chain-of-thought
+// reasoning trace for auditability.
+message NetworkIntent {
+  // Globally unique intent identifier (UUID-v4 recommended).
+  string intent_id                    = 1;
+  // Natural-language rationale summarising the LLM's motivation.
+  string rationale                    = 2;
+  // Wall-clock timestamp when the LLM generated this intent.
+  google.protobuf.Timestamp generated_at = 3;
+  // Target element this intent applies to.
+  string target_element_id            = 4;
+  // High-level intent category.
+  IntentCategory category             = 5;
+  // LLM confidence score [0.0, 1.0].
+  double confidence_score             = 6;
+
+  // Ordered reasoning steps (chain-of-thought).
+  repeated ReasoningStep reasoning_trace = 10;
+
+  // Domain-specific sub-intents (exactly one should be populated
+  // for a well-formed intent, but the schema allows multiple for
+  // composite intents spanning multiple domains).
+  RadioIntent    radio               = 20;
+  CoreIntent     core                = 21;
+  TransportIntent transport          = 22;
+  SecurityIntent security           = 23;
+}
+
+// ============================================================================
+// Validation Results
+// ============================================================================
+
+// Individual CBF barrier check result.
+message BarrierCheck {
+  // Barrier identifier (e.g., "tx_power_ceiling").
+  string barrier_id                  = 1;
+  // Human-readable barrier expression (e.g., "43 - u_tx >= 0").
+  string barrier_expr                = 2;
+  // Evaluated left-hand side of the barrier inequality.
+  double left_hand_side              = 3;
+  // Evaluated right-hand side (typically 0 for h(x) >= 0).
+  double right_hand_side             = 4;
+  // Safety margin: LHS − RHS.
+  double margin                      = 5;
+  // True if the barrier constraint is satisfied.
+  bool passed                        = 6;
+}
+
+// Composite CBF validation result across all barriers.
+message CbfResult {
+  // Individual barrier check results.
+  repeated BarrierCheck barrier_checks  = 1;
+  // Minimum margin across all barriers (worst case).
+  double minimum_margin                = 2;
+  // True if ALL barriers passed.
+  bool passed                          = 3;
+}
+
+// Lyapunov stability check result.
+message LyapunovResult {
+  // Current Lyapunov function value V(x).
+  double v_value                       = 1;
+  // Computed time derivative V̇(x, u).
+  double v_dot                         = 2;
+  // Decay rate constant α.
+  double alpha                         = 3;
+  // Stability threshold: −α·V(x).
+  double threshold                     = 4;
+  // True if V̇(x, u) ≤ −α·V(x).
+  bool passed                          = 5;
+}
+
+// Zeno temporal guard check result.
+message ZenoResult {
+  // Time elapsed since last actuation (ms).
+  double time_since_last_ms           = 1;
+  // Minimum permitted inter-actuation interval (ms).
+  double tau_min_ms                   = 2;
+  // True if Δt ≥ τ_min (no Zeno behaviour).
+  bool passed                         = 3;
+}
+
+// Structured cue validation feedback (Cue-specific errors/warnings).
+message CueResult {
+  // Number of errors encountered (>= 1 means DENY).
+  uint32 errors                       = 1;
+  // Number of warnings (informational, do not block).
+  uint32 warnings                     = 2;
+  // Human-readable list of messages (new-line separated).
+  repeated string messages             = 3;
+}
+
+// ============================================================================
+// Intent Verdict — returned by IntentValidationService
+// ============================================================================
+
+// The comprehensive validation verdict returned by the DSF after
+// evaluating an intent against all safety invariants.
+message IntentVerdict {
+  // Globally unique verdict identifier.
+  string verdict_id                     = 1;
+  // Corresponding intent identifier.
+  string intent_id                      = 2;
+  // Final decision.
+  VerdictDecision decision              = 3;
+
+  // Sub-system validation results.
+  CbfResult      cbf_result             = 10;
+  LyapunovResult lyapunov_result       = 11;
+  ZenoResult    zeno_result            = 12;
+  CueResult     cue_result             = 13;
+
+  // If decision == AMEND, this carries the safe subset of the intent
+  // that passed validation.
+  AppliedConfiguration safe_config     = 20;
+
+  // Human-readable explanation of the verdict.
+  string explanation                    = 30;
+  // Wall-clock timestamp of verdict generation.
+  google.protobuf.Timestamp decided_at  = 31;
+}
+
+// Configuration to be applied to Osmocom elements after a positive
+// (ALLOW or AMEND) verdict. Maps Osmocom command names to their
+// serialised parameter payloads.
+message AppliedConfiguration {
+  // Map of Osmocom command name → JSON-encoded parameter string.
+  // Keys correspond to VTY or CTRL interface commands.
+  map<string, string> osmocom_commands  = 1;
+  // Monotonic revision number for this configuration.
+  uint64 config_revision               = 2;
+}
+
+// ============================================================================
+// Intent Validation Service (gRPC)
+// ============================================================================
+
+// The IntentValidationService is the DSF's northbound interface.
+// The TelcoLLM submits intents; the DSF validates and returns verdicts.
+service IntentValidationService {
+
+  // Unary RPC: validate a single intent and return a verdict.
+  // This is the primary path for LLM-generated intents.
+  rpc ValidateIntent(NetworkIntent) returns (IntentVerdict);
+
+  // Bidirectional streaming RPC: continuous intent submission and
+  // verdict delivery. The client sends intents; the server replies
+  // with verdicts. Used for high-frequency intent loops (e.g., 6G
+  // sub-THz beam tracking at 1 ms cadence).
+  rpc ValidateIntentStream(stream NetworkIntent) returns (stream IntentVerdict);
+
+  // Unary RPC: retrieve the current applied configuration state.
+  // Used by the LLM to ground its reasoning in the actual network
+  // state before generating the next intent.
+  rpc GetCurrentConfig(GetCurrentConfigRequest) returns (CurrentConfigResponse);
+}
+
+// Request for GetCurrentConfig.
+message GetCurrentConfigRequest {
+  // Optional element filter. If empty, returns all elements.
+  string element_id                 = 1;
+}
+
+// Response for GetCurrentConfig.
+message CurrentConfigResponse {
+  // Per-element applied configurations.
+  map<string, AppliedConfiguration> configs = 1;
+  // Wall-clock timestamp of the configuration snapshot.
+  google.protobuf.Timestamp snapshot_time = 2;
+}

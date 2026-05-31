@@ -1,0 +1,469 @@
+# ============================================================================
+# abis.yaml — Deterministic Digital Immunity for 6G Networks
+# Phase 1: Golden Baseline Configuration for OsmoBTS (2G/4G)
+# ============================================================================
+#
+# This YAML file serves as the immutable golden baseline for an OsmoBTS
+# element. The DSF (Decision Safety Filter) uses this baseline to anchor
+# safety-barrier evaluations: every LLM-generated intent is checked against
+# the per-parameter safe ranges defined in the _cbf_safety_envelope section.
+#
+# Target element: OsmoBTS sysmoBTS 2050 (DCS1800 / GSM-1800)
+# Osmocom version:  1.8.0+
+#
+# CAUTION: This file is under DSF governance. Manual edits to parameters
+#          outside the _cbf_safety_envelope ranges will be REJECTED by the
+#          IntentValidationService.
+# ============================================================================
+
+_metadata:
+  # Schema version for forward-compatibility checks.
+  schema_version: "1.0.0"
+
+  # SHA-256 fingerprint of the canonical golden baseline.
+  # Computed over all fields EXCEPT _metadata._last_validated_at.
+  # The DSF recomputes and compares this on every intent evaluation.
+  config_fingerprint_sha256: "a3f1b2c4d5e6f7890123456789abcdef0123456789abcdef0123456789abcdef"
+
+  # Globally unique identifier of the BTS element this config targets.
+  target_element_id: "BTS-DUS-DCS001"
+
+  # Timestamp of last successful DSF validation.
+  _last_validated_at: "2025-01-15T10:30:00Z"
+
+# ============================================================================
+# BTS (Base Transceiver Station) Configuration
+# ============================================================================
+
+bts:
+  # BTS type. OsmoBTS supports osmo-bts-trx (generic TRX) and
+  # variant-specific types: sysmobts, lc15, oc2g, octphy.
+  type: "osmo-bts-sysmo"
+  model: "2050"
+
+  # Operating band. 3GPP TS 45.005.
+  # DCS1800: 1710–1785 MHz UL / 1805–1880 MHz DL.
+  band: "DCS1800"
+
+  # Absolute Radio Frequency Channel Number (ARFCN) list with per-channel
+  # power reduction. DCS1800 ARFCN range: 512–885.
+  # Each entry specifies the channel number and an optional power reduction
+  # (dB) relative to the TRX nominal power.
+  arfcn_list:
+    - arfcn: 698
+      power_reduction_db: 0
+    - arfcn: 699
+      power_reduction_db: 0
+    - arfcn: 700
+      power_reduction_db: 2
+    - arfcn: 701
+      power_reduction_db: 4
+    - arfcn: 702
+      power_reduction_db: 2
+
+  # Cell Identity (28 bits, hex). Unique within the PLMN + LAC.
+  cell_identity: "0x00A1"
+
+  # Location Area Code (16 bits, hex). Used for LA-based paging.
+  location_area_code: "0x0001"
+
+  # Base Station Identity Code (BSIC). 6 bits NCC + 6 bits BCC.
+  # NCC (0–7): distinguishes BTSes from different operators on same channel.
+  # BCC (0–7): distinguishes BTSes from same operator on same channel.
+  bsic:
+    ncc: 0
+    bcc: 1
+
+  # Training Sequence Code (TSC). Range: 0–7. Must differ from neighbours
+  # on the same ARFCN to avoid co-channel interference on the sync channel.
+  tsc: 1
+
+  # Neighbour cell list for cell reselection (BCCH allocation).
+  # Each neighbour provides ARFCN, BSIC, and optional RxLev offset.
+  neighbors:
+    - arfcn: 690
+      bsic_ncc: 1
+      bsic_bcc: 0
+      rxlev_min_db: -100
+      cell_reselection_offset_db: 2
+    - arfcn: 692
+      bsic_ncc: 1
+      bsic_bcc: 2
+      rxlev_min_db: -100
+      cell_reselection_offset_db: 0
+
+# ============================================================================
+# A-bis Interface Configuration
+# ============================================================================
+
+abis:
+  # Transport type. "ipa" = Osmocom IPA multiplex over TCP/IP.
+  # Alternative: "e1" (legacy E1/T1 timeslot-based transport).
+  transport: "ipa"
+
+  # Remote (BSC) endpoint for IPA-over-IP A-bis connection.
+  remote:
+    ip: "10.0.1.10"
+    port: 3002
+
+  # Stream identifiers for IPA multiplex.
+  # Each logical channel (OML, RSL) is carried over a separate IPA stream.
+  oml_stream_id: 0xFF   # OML (Operations & Maintenance Link)
+  rsl_stream_id: 0x00   # RSL (Radio Signalling Link, first TRX)
+
+  # Timers for A-bis keepalive and reconnection.
+  timers:
+    keepalive_interval_s: 30
+    reconnect_delay_s: 5
+    reconnect_max_delay_s: 300
+    oml_timeout_s: 10
+    rsl_timeout_s: 5
+
+# ============================================================================
+# TRX (Transceiver) Configuration
+# ============================================================================
+
+trx:
+  # Number of TRX instances (carrier frequencies).
+  num_instances: 2
+
+  # Nominal transmit power at the antenna connector (dBm).
+  # 43 dBm = 20 W (maximum for GSM-1800 macro BTS).
+  tx_power_dbm: 43
+
+  # Power control parameters.
+  power_control:
+    # Power reduction step size (dB).
+    # Applied when the BTS reduces power during DTX/DRX or CBF enforcement.
+    reduction_step_db: 2
+
+    # Maximum number of power-control commands per second.
+    # CBF safety envelope enforces Zeno guard on power adjustments.
+    max_commands_per_second: 10
+
+    # Minimum allowed transmit power (dBm).
+    # Safety floor: prevents radio silence.
+    min_power_dbm: 5
+
+    # Maximum allowed transmit power (dBm).
+    # Safety ceiling: prevents regulatory over-radiation.
+    max_power_dbm: 43
+
+  # Per-TRX configuration (index 0 = BCCH carrier, must always be present).
+  instances:
+    - trx_index: 0
+      arfcn: 698
+      max_tx_power_dbm: 43
+      power_reduction_db: 0
+    - trx_index: 1
+      arfcn: 700
+      max_tx_power_dbm: 41
+      power_reduction_db: 2
+
+# ============================================================================
+# RRM (Radio Resource Management)
+# ============================================================================
+
+rrm:
+  # Cell reselection parameters (broadcast on BCCH/SI3).
+  cell_reselection:
+    # Cell reselection hysteresis (dB).
+    # 3GPP TS 45.008 §10.1: range 0–14 dB in 2 dB steps.
+    hysteresis_db: 4
+
+    # Periodic search for better cell.
+    # Enable/disable periodic neighbour search.
+    periodic_search_enabled: true
+
+    # Search interval for periodic neighbour search (seconds).
+    periodic_search_interval_s: 60
+
+    # Penalty time for temporary offset (seconds).
+    penalty_time_s: 20
+
+    # Per-neighbour offsets (overrides defaults above).
+    # Keyed by neighbour ARFCN.
+    neighbour_offsets:
+      "690": { offset_db: 2 }
+      "692": { offset_db: 0 }
+
+  # Handover parameters ( intra-BSC, controlled via RSL).
+  handover:
+    # Power budget handover threshold (dB).
+    # HO triggered when neighbour RxLev - serving RxLev > pwr_budget_threshold.
+    pwr_budget_threshold_db: 6
+
+    # Minimum RxLev to consider a target cell for handover (dBm).
+    rxlev_min_dbm: -100
+
+    # Minimum RxQual of the serving cell to trigger HO (0–7, 7 = worst).
+    rxlev_ho_threshold_dbm: -95
+
+    # Handover algorithm timeout (ms). Prevents ping-pong handovers.
+    ho_timeout_ms: 5000
+
+    # Maximum number of handovers per UE per second.
+    # Enforced by the Zeno guard in the DSF.
+    max_ho_per_ue_per_second: 1
+
+    # Averaging window for RxLev/RxQual measurements (seconds).
+    averaging_window_s: 1
+
+  # Downlink power control (dynamic).
+  power_control:
+    # Enable/disable dynamic downlink power control.
+    enabled: true
+
+    # Power control interval (SACCH multiframe count, 480 ms each).
+    interval_sacch_blocks: 2
+
+    # Target RxLev at the UE (dBm).
+    target_rxlev_dbm: -85
+
+    # Power control delta per step (dB).
+    step_size_db: 2
+
+    # RxLev range where power control is active (dBm).
+    lower_rxlev_threshold_dbm: -100
+    upper_rxlev_threshold_dbm: -75
+
+# ============================================================================
+# Channel (Timeslot) Configuration
+# ============================================================================
+# GSM-1800 uses 8 timeslots per TRX. The BCCH carrier (TRX 0) requires
+# TS0 as BCCH/CCCH. Remaining timeslots are configured as TCH/F, TCH/H,
+# SDCCH, or PDCH (GPRS/EDGE).
+#
+# phys_chan_config values (OsmoBTS nomenclature):
+#   CCCH+SDCCH4 - Combined BCCH/CCCH with SDCCH (small cells)
+#   CCCH+SDCCH4+CBCH - Above with cell broadcast
+#   SDCCH8 - Standalone SDCCH (large cells, BCCH on CCCH)
+#   TCH/F - Traffic channel, full rate
+#   TCH/H - Traffic channel, half rate
+#   PDCH   - Packet data channel (GPRS/EDGE)
+#   TCH/F_PDCH - Dynamic switching (Osmocom specific)
+#   NONE   - Disabled
+
+channel:
+  timeslots:
+    # TS0: BCCH/CCCH+SDCCH4 (combined) — BCCH carrier
+    - ts_index: 0
+      phys_chan_config: "CCCH+SDCCH4"
+      combined_ccch: true
+      imm_ass_timer_s: 10
+
+    # TS1: SDCCH8 (standalone signalling channels)
+    - ts_index: 1
+      phys_chan_config: "SDCCH8"
+      combined_ccch: false
+      imm_ass_timer_s: 10
+
+    # TS2: TCH/F (traffic, full rate)
+    - ts_index: 2
+      phys_chan_config: "TCH/F"
+      imm_ass_timer_s: 5
+
+    # TS3: TCH/F (traffic, full rate)
+    - ts_index: 3
+      phys_chan_config: "TCH/F"
+      imm_ass_timer_s: 5
+
+    # TS4: TCH/F (traffic, full rate)
+    - ts_index: 4
+      phys_chan_config: "TCH/F"
+      imm_ass_timer_s: 5
+
+    # TS5: TCH/F (traffic, full rate)
+    - ts_index: 5
+      phys_chan_config: "TCH/F"
+      imm_ass_timer_s: 5
+
+    # TS6: TCH/F_PDCH (dynamic TCH/GPRS)
+    - ts_index: 6
+      phys_chan_config: "TCH/F_PDCH"
+      imm_ass_timer_s: 5
+
+    # TS7: TCH/F_PDCH (dynamic TCH/GPRS)
+    - ts_index: 7
+      phys_chan_config: "TCH/F_PDCH"
+      imm_ass_timer_s: 5
+
+# ============================================================================
+# CBF Safety Envelope
+# ============================================================================
+# Defines the per-parameter safe ranges and barrier functions that the DSF
+# enforces for this element. The _cbf_safety_envelope is the DSF's ground
+# truth for what constitutes a "safe" configuration state.
+#
+# Barrier classes:
+#   ceiling  — h(x) = ceiling - value >= 0  (upper bound)
+#   floor    — h(x) = value - floor >= 0     (lower bound)
+#   band     — h(x) = value - floor >= 0 AND ceiling - value >= 0
+#
+# CBF class-K function: γ(h) = k·h (extended class-K, k > 0).
+# Lyapunov decay: V̇(x) ≤ -α·V(x), α > 0.
+
+_cbf_safety_envelope:
+  version: "1.0.0"
+  generated_at: "2025-01-15T10:30:00Z"
+
+  # Per-parameter safety barriers.
+  barriers:
+
+    # --- Transmit Power ---
+    - parameter: "trx.tx_power_dbm"
+      barrier_class: "band"
+      floor: 5
+      ceiling: 43
+      barrier_id: "tx_power_band"
+      expression: "h(x) = min(tx_power - 5, 43 - tx_power) >= 0"
+      margin_warning_db: 3      # Warn when margin < 3 dB
+
+    - parameter: "trx.power_control.min_power_dbm"
+      barrier_class: "floor"
+      floor: 0
+      ceiling: 10
+      barrier_id: "min_power_floor"
+      expression: "h(x) = min_power - 0 >= 0"
+
+    - parameter: "trx.power_control.max_power_dbm"
+      barrier_class: "ceiling"
+      floor: 35
+      ceiling: 46
+      barrier_id: "max_power_ceiling"
+      expression: "h(x) = 46 - max_power >= 0"
+
+    - parameter: "trx.power_control.reduction_step_db"
+      barrier_class: "band"
+      floor: 1
+      ceiling: 6
+      barrier_id: "reduction_step_band"
+      expression: "h(x) = min(step - 1, 6 - step) >= 0"
+
+    - parameter: "trx.power_control.max_commands_per_second"
+      barrier_class: "band"
+      floor: 1
+      ceiling: 20
+      barrier_id: "power_ctrl_rate_limit"
+      expression: "h(x) = min(rate - 1, 20 - rate) >= 0"
+
+    # --- RRM Cell Reselection ---
+    - parameter: "rrm.cell_reselection.hysteresis_db"
+      barrier_class: "band"
+      floor: 0
+      ceiling: 14
+      barrier_id: "cell_resel_hyst_band"
+      expression: "h(x) = min(hyst - 0, 14 - hyst) >= 0"
+
+    # --- RRM Handover ---
+    - parameter: "rrm.handover.pwr_budget_threshold_db"
+      barrier_class: "band"
+      floor: 2
+      ceiling: 16
+      barrier_id: "ho_pwr_budget_band"
+      expression: "h(x) = min(pwr_budget - 2, 16 - pwr_budget) >= 0"
+
+    - parameter: "rrm.handover.max_ho_per_ue_per_second"
+      barrier_class: "band"
+      floor: 0
+      ceiling: 2
+      barrier_id: "ho_rate_limit"
+      expression: "h(x) = min(ho_rate - 0, 2 - ho_rate) >= 0"
+
+    # --- Resource Utilisation (soft barriers) ---
+    - parameter: "resource.cpu_utilisation"
+      barrier_class: "ceiling"
+      floor: 0.0
+      ceiling: 0.95
+      barrier_id: "cpu_ceiling"
+      expression: "h(x) = 0.95 - cpu >= 0"
+
+    - parameter: "resource.memory_utilisation"
+      barrier_class: "ceiling"
+      floor: 0.0
+      ceiling: 0.90
+      barrier_id: "memory_ceiling"
+      expression: "h(x) = 0.90 - memory >= 0"
+
+    - parameter: "resource.temperature_celsius"
+      barrier_class: "ceiling"
+      floor: 0.0
+      ceiling: 75.0
+      barrier_id: "temp_ceiling"
+      expression: "h(x) = 75.0 - temperature >= 0"
+
+  # Global safety parameters.
+  global:
+    # Lyapunov decay rate constant α.
+    # V̇(x) ≤ -α·V(x). Higher α → faster convergence but tighter constraint.
+    lyapunov_alpha: 0.1
+
+    # Class-K constant k for γ(h) = k·h.
+    class_k_constant: 1.0
+
+  # Zeno temporal guard parameters.
+  zeno_guard:
+    # Minimum inter-actuation time τ_min (milliseconds).
+    # Prevents the LLM/DSF from issuing commands at an infinite rate.
+    tau_min_ms: 500
+
+    # Observation window size (number of recent actuations to track).
+    window_size: 5
+
+    # Cooldown period after a Zeno violation (seconds).
+    # The DSF blocks all actuations for this duration after detecting Zeno.
+    cooldown_on_violation_s: 2.0
+
+  # Lyapunov function configuration.
+  lyapunov:
+    # Decay rate α.
+    alpha: 0.1
+
+    # Reference state (all parameters at their nominal baseline).
+    reference_state:
+      trx_tx_power_dbm: 43.0
+      cell_reselection_hysteresis_db: 4.0
+      ho_pwr_budget_threshold_db: 6.0
+      cpu_utilisation: 0.5
+      memory_utilisation: 0.5
+      temperature_celsius: 45.0
+
+# ============================================================================
+# Telemetry Export Configuration
+# ============================================================================
+
+telemetry:
+  # Kafka-based telemetry export for DSF consumption.
+  kafka:
+    enabled: true
+
+    # Kafka bootstrap servers (comma-separated).
+    bootstrap_servers: "kafka-broker-1:9092,kafka-broker-2:9092"
+
+    # Topic for NetworkState messages (Avro-encoded).
+    topic: "telecomm.telemetry.network_state.v1"
+
+    # Producer settings.
+    producer:
+      client_id: "BTS-DUS-DCS001"
+      acks: "all"                    # Wait for all ISR replicas
+      max_retries: 3
+      retry_backoff_ms: 100
+      linger_ms: 10                  # Batch up to 10 ms
+      batch_size_bytes: 65536        # 64 KB
+      compression_type: "lz4"
+
+    # Telemetry sampling interval (milliseconds).
+    # DCS1800 2G: 480 ms per SACCH multiframe is natural.
+    sampling_interval_ms: 480
+
+    # Schema registry URL for Avro schema management.
+    schema_registry_url: "http://schema-registry:8081"
+
+    # Exported metric groups.
+    export:
+      radio_metrics: true
+      bearer_metrics: true
+      resource_metrics: true
+      qos_snapshots: true
+      safety_alerts: true

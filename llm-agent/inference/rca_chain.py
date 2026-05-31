@@ -1,0 +1,1403 @@
+"""
+Root Cause Analysis Chain for 6G Digital Immunity Simulation.
+
+Processes Kafka telemetry streams from Osmocom to identify network anomalies,
+correlate root causes, and feed anomaly reports into the intent generation pipeline.
+
+Architecture Context:
+    TelcoLLM Agent (inference-net 172.29.x.0/24) consumes Kafka telemetry produced
+    by Osmocom elements. iptables rules prevent direct Osmocom communication;
+    all telemetry flows through Kafka topics.
+
+Dependencies:
+    - kafka-python (confluent-kafka or kafka-python)
+    - numpy
+
+Usage:
+    from llm_agent.inference.rca_chain import RCAPipeline
+
+    pipeline = RCAPipeline(
+        kafka_config={"bootstrap_servers": "172.29.0.10:9092", "topic": "osmocom-telemetry"},
+    )
+    pipeline.run_continuous(callback=lambda anomalies: print(f"Found {len(anomalies)} anomalies"))
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants / Default Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_RADIO_THRESHOLDS: dict[str, float] = {
+    "rsrp_min": -100.0,  # dBm – below this → degradation
+    "rsrq_min": -15.0,  # dB  – below this → degradation
+    "sinr_min": -5.0,  # dB  – below this → degradation
+    "rsrp_drop_std": 3.0,  # dBm – std-dev of recent readings indicating rapid drop
+}
+
+DEFAULT_BEARER_THRESHOLDS: dict[str, float] = {
+    "packet_loss_rate_max": 0.05,
+    "throughput_drop_ratio": 0.50,
+    "rtt_spike_ms": 100.0,
+    "bearer_setup_failure_rate": 0.10,
+}
+
+DEFAULT_RESOURCE_THRESHOLDS: dict[str, float] = {
+    "cpu_max": 0.90,
+    "memory_max": 0.85,
+    "temperature_max": 70.0,  # °C
+    "gtpu_tunnel_util_max": 0.95,
+}
+
+DEFAULT_HANDOVER_THRESHOLDS: dict[str, float] = {
+    "ho_rate_max": 30.0,  # handovers per second
+    "reselection_failure_rate": 0.15,
+    "ho_success_rate_min": 0.85,
+}
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+
+class AnomalyType(Enum):
+    """Classification of detected network anomalies."""
+
+    RADIO_DEGRADATION = "radio_degradation"
+    BEARER_FAILURE = "bearer_failure"
+    RESOURCE_EXHAUSTION = "resource_exhaustion"
+    HANDOVER_FAILURE = "handover_failure"
+    SIGNALING_STORM = "signaling_storm"
+    LATENCY_SPIKE = "latency_spike"
+    INTERFERENCE = "interference"
+    CELL_OUTAGE = "cell_outage"
+
+
+class Severity(Enum):
+    """Anomaly severity levels – used for alerting priority."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+# ---------------------------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TelemetryReading:
+    """Single telemetry reading from an Osmocom network element.
+
+    Attributes:
+        element_id:     Unique identifier of the network element (e.g. eNB/gNB ID).
+        element_label:  Human-readable label for the element.
+        state:          Operational state (e.g. "active", "degraded", "offline").
+        radio_metrics:  Radio access metrics (RSRP, RSRQ, SINR, etc.).
+        bearer_metrics: Bearer/session metrics (packet loss, throughput, RTT, etc.).
+        resource_metrics: Infrastructure resource metrics (CPU, memory, temp, etc.).
+        timestamp:      Unix epoch timestamp (seconds) when the reading was captured.
+    """
+
+    element_id: str
+    element_label: str
+    state: str
+    radio_metrics: dict[str, Any] = field(default_factory=dict)
+    bearer_metrics: dict[str, Any] = field(default_factory=dict)
+    resource_metrics: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class Anomaly:
+    """Detected network anomaly produced by the RCA engine.
+
+    Attributes:
+        anomaly_id:      Unique identifier for this anomaly instance.
+        element_id:      The network element where the anomaly was detected.
+        anomaly_type:    Classification of the anomaly.
+        severity:        Severity level (LOW / MEDIUM / HIGH / CRITICAL).
+        description:     Human-readable description of the anomaly.
+        detected_at:     Unix epoch timestamp when the anomaly was detected.
+        confidence:      Confidence score in [0.0, 1.0].
+        metrics_snapshot: Key metrics at the time of detection for auditability.
+        suggested_action: Optional remediation hint generated by the detector.
+    """
+
+    anomaly_id: str = ""
+    element_id: str = ""
+    anomaly_type: AnomalyType = AnomalyType.RADIO_DEGRADATION
+    severity: Severity = Severity.LOW
+    description: str = ""
+    detected_at: float = field(default_factory=time.time)
+    confidence: float = 0.0
+    metrics_snapshot: dict[str, Any] = field(default_factory=dict)
+    suggested_action: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.anomaly_id:
+            self.anomaly_id = f"anomaly-{uuid.uuid4().hex[:12]}"
+
+
+# ---------------------------------------------------------------------------
+# Anomaly Detectors
+# ---------------------------------------------------------------------------
+
+
+class AnomalyDetector:
+    """Detects anomalies in individual telemetry dimensions.
+
+    Each detection method returns a list of :class:`Anomaly` objects found
+    in the supplied reading.  Thresholds are configurable via the constructor.
+
+    Args:
+        config: Optional dictionary overriding default detection thresholds.
+                Supported keys are grouped under ``radio``, ``bearer``,
+                ``resource``, and ``handover`` sub-dicts.
+    """
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self._config = config or {}
+
+        self._radio_thresholds = self._config.get("radio", DEFAULT_RADIO_THRESHOLDS)
+        self._bearer_thresholds = self._config.get("bearer", DEFAULT_BEARER_THRESHOLDS)
+        self._resource_thresholds = self._config.get(
+            "resource", DEFAULT_RESOURCE_THRESHOLDS
+        )
+        self._handover_thresholds = self._config.get(
+            "handover", DEFAULT_HANDOVER_THRESHOLDS
+        )
+
+        logger.debug(
+            "AnomalyDetector initialised with thresholds: "
+            "radio=%s bearer=%s resource=%s handover=%s",
+            self._radio_thresholds,
+            self._bearer_thresholds,
+            self._resource_thresholds,
+            self._handover_thresholds,
+        )
+
+    # ---- Radio ----------------------------------------------------------------
+
+    def detect_radio_anomalies(self, reading: TelemetryReading) -> list[Anomaly]:
+        """Detect radio-access degradation anomalies.
+
+        Checks:
+        - RSRP below minimum threshold
+        - RSRQ below minimum threshold
+        - SINR below minimum threshold
+        - Rapid RSRP drops (volatility check)
+        """
+        anomalies: list[Anomaly] = []
+        rm = reading.radio_metrics
+
+        if not rm:
+            return anomalies
+
+        checks: list[tuple[str, float, float, str]] = [
+            (
+                "rsrp",
+                self._radio_thresholds["rsrp_min"],
+                "below",
+                f"RSRP {rm.get('rsrp', 'N/A')} dBm is below "
+                f"{self._radio_thresholds['rsrp_min']} dBm threshold",
+            ),
+            (
+                "rsrq",
+                self._radio_thresholds["rsrq_min"],
+                "below",
+                f"RSRQ {rm.get('rsrq', 'N/A')} dB is below "
+                f"{self._radio_thresholds['rsrq_min']} dB threshold",
+            ),
+            (
+                "sinr",
+                self._radio_thresholds["sinr_min"],
+                "below",
+                f"SINR {rm.get('sinr', 'N/A')} dB is below "
+                f"{self._radio_thresholds['sinr_min']} dB threshold",
+            ),
+        ]
+
+        for metric_key, threshold, direction, description_tpl in checks:
+            value = rm.get(metric_key)
+            if value is None:
+                continue
+            try:
+                value_f = float(value)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Non-numeric radio metric %s=%r for element %s",
+                    metric_key,
+                    value,
+                    reading.element_id,
+                )
+                continue
+
+            triggered = False
+            if direction == "below" and value_f < threshold:
+                triggered = True
+
+            if triggered:
+                severity = self._radio_severity(metric_key, value_f, threshold)
+                anomalies.append(
+                    Anomaly(
+                        element_id=reading.element_id,
+                        anomaly_type=AnomalyType.RADIO_DEGRADATION,
+                        severity=severity,
+                        description=description_tpl,
+                        confidence=self._radio_confidence(
+                            metric_key, value_f, threshold
+                        ),
+                        metrics_snapshot={
+                            "metric": metric_key,
+                            "value": value_f,
+                            "threshold": threshold,
+                        },
+                        suggested_action="Investigate radio conditions; consider TX power "
+                        "or antenna parameter adjustment",
+                    )
+                )
+
+        # Rapid RSRP drops – volatility check
+        rsrp_history = rm.get("rsrp_history")
+        if rsrp_history and isinstance(rsrp_history, (list, np.ndarray)):
+            history_arr = np.array(rsrp_history, dtype=np.float64)
+            if len(history_arr) >= 3:
+                std_dev = float(np.std(history_arr))
+                drop_threshold = self._radio_thresholds["rsrp_drop_std"]
+                if std_dev > drop_threshold:
+                    trend = self._compute_simple_trend(history_arr)
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.RADIO_DEGRADATION,
+                            severity=Severity.HIGH
+                            if std_dev > drop_threshold * 2
+                            else Severity.MEDIUM,
+                            description=(
+                                f"Rapid RSRP volatility detected: std={std_dev:.2f} dBm "
+                                f"(threshold={drop_threshold}), trend={trend:+.2f} dBm/sample"
+                            ),
+                            confidence=min(
+                                0.95, 0.6 + 0.3 * (std_dev / drop_threshold - 1.0)
+                            ),
+                            metrics_snapshot={
+                                "metric": "rsrp_volatility",
+                                "std_dev": std_dev,
+                                "history_length": len(history_arr),
+                                "trend": trend,
+                            },
+                            suggested_action="Monitor for impending cell edge condition; "
+                            "prepare handover parameter adjustment",
+                        )
+                    )
+
+        # Interference detection via high noise floor
+        noise_floor = rm.get("noise_floor_dbm")
+        if noise_floor is not None:
+            try:
+                nf = float(noise_floor)
+                if nf > -90.0:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.INTERFERENCE,
+                            severity=Severity.MEDIUM if nf > -85.0 else Severity.LOW,
+                            description=f"Elevated noise floor detected: {nf:.1f} dBm (> -90 dBm)",
+                            confidence=0.7,
+                            metrics_snapshot={
+                                "metric": "noise_floor_dbm",
+                                "value": nf,
+                                "threshold": -90.0,
+                            },
+                            suggested_action="Scan for interference sources; consider "
+                            "cell reselection offset adjustment",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        logger.debug(
+            "Radio anomaly detection for %s: %d anomalies found",
+            reading.element_id,
+            len(anomalies),
+        )
+        return anomalies
+
+    # ---- Bearer ---------------------------------------------------------------
+
+    def detect_bearer_anomalies(self, reading: TelemetryReading) -> list[Anomaly]:
+        """Detect bearer/session-layer anomalies.
+
+        Checks:
+        - Packet loss rate exceeding threshold
+        - Throughput drops greater than 50 % from baseline
+        - RTT spikes
+        - Bearer setup failure rate
+        """
+        anomalies: list[Anomaly] = []
+        bm = reading.bearer_metrics
+
+        if not bm:
+            return anomalies
+
+        # Packet loss rate
+        plr = bm.get("packet_loss_rate")
+        if plr is not None:
+            try:
+                plr_f = float(plr)
+                threshold = self._bearer_thresholds["packet_loss_rate_max"]
+                if plr_f > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.BEARER_FAILURE,
+                            severity=self._bearer_severity("packet_loss_rate", plr_f),
+                            description=(
+                                f"Packet loss rate {plr_f:.4f} exceeds threshold "
+                                f"{threshold:.4f} on element {reading.element_id}"
+                            ),
+                            confidence=min(0.95, 0.5 + plr_f),
+                            metrics_snapshot={
+                                "metric": "packet_loss_rate",
+                                "value": plr_f,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Investigate congestion or transport issues; "
+                            "consider QoS profile adjustment",
+                        )
+                    )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Non-numeric packet_loss_rate for element %s", reading.element_id
+                )
+
+        # Throughput drop
+        throughput = bm.get("throughput_bps")
+        baseline_throughput = bm.get("baseline_throughput_bps")
+        if throughput is not None and baseline_throughput is not None:
+            try:
+                tp_f = float(throughput)
+                bl_f = float(baseline_throughput)
+                if bl_f > 0:
+                    drop_ratio = 1.0 - (tp_f / bl_f)
+                    threshold = self._bearer_thresholds["throughput_drop_ratio"]
+                    if drop_ratio > threshold:
+                        anomalies.append(
+                            Anomaly(
+                                element_id=reading.element_id,
+                                anomaly_type=AnomalyType.BEARER_FAILURE,
+                                severity=Severity.HIGH
+                                if drop_ratio > 0.75
+                                else Severity.MEDIUM,
+                                description=(
+                                    f"Throughput drop of {drop_ratio:.1%} detected "
+                                    f"(current={tp_f:.0f} bps, baseline={bl_f:.0f} bps)"
+                                ),
+                                confidence=min(0.95, 0.5 + drop_ratio),
+                                metrics_snapshot={
+                                    "metric": "throughput_drop",
+                                    "current": tp_f,
+                                    "baseline": bl_f,
+                                    "drop_ratio": drop_ratio,
+                                },
+                                suggested_action="Check for congestion or radio degradation; "
+                                "consider MBR/GBR QoS adjustment",
+                            )
+                        )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Non-numeric throughput metrics for element %s", reading.element_id
+                )
+
+        # RTT spikes
+        rtt_ms = bm.get("rtt_ms")
+        if rtt_ms is not None:
+            try:
+                rtt_f = float(rtt_ms)
+                threshold = self._bearer_thresholds["rtt_spike_ms"]
+                if rtt_f > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.LATENCY_SPIKE,
+                            severity=Severity.HIGH
+                            if rtt_f > 200.0
+                            else Severity.MEDIUM,
+                            description=f"RTT spike detected: {rtt_f:.1f} ms (threshold={threshold} ms)",
+                            confidence=min(0.95, 0.4 + 0.5 * (rtt_f / (threshold * 3))),
+                            metrics_snapshot={
+                                "metric": "rtt_ms",
+                                "value": rtt_f,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Investigate transport path latency; "
+                            "check for bufferbloat or core network congestion",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        # Bearer setup failure rate
+        setup_fail_rate = bm.get("bearer_setup_failure_rate")
+        if setup_fail_rate is not None:
+            try:
+                sfr_f = float(setup_fail_rate)
+                threshold = self._bearer_thresholds["bearer_setup_failure_rate"]
+                if sfr_f > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.BEARER_FAILURE,
+                            severity=Severity.HIGH if sfr_f > 0.20 else Severity.MEDIUM,
+                            description=(
+                                f"Bearer setup failure rate {sfr_f:.4f} exceeds "
+                                f"threshold {threshold:.4f}"
+                            ),
+                            confidence=min(0.90, 0.5 + sfr_f * 2),
+                            metrics_snapshot={
+                                "metric": "bearer_setup_failure_rate",
+                                "value": sfr_f,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Investigate core network signaling; "
+                            "check MME/AMF capacity",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        logger.debug(
+            "Bearer anomaly detection for %s: %d anomalies found",
+            reading.element_id,
+            len(anomalies),
+        )
+        return anomalies
+
+    # ---- Resource -------------------------------------------------------------
+
+    def detect_resource_anomalies(self, reading: TelemetryReading) -> list[Anomaly]:
+        """Detect infrastructure resource anomalies.
+
+        Checks:
+        - CPU utilisation exceeding 90 %
+        - Memory utilisation exceeding 85 %
+        - Temperature exceeding 70 °C
+        - GTP-U tunnel count approaching maximum capacity
+        """
+        anomalies: list[Anomaly] = []
+        res = reading.resource_metrics
+
+        if not res:
+            return anomalies
+
+        # CPU utilisation
+        cpu = res.get("cpu_utilization")
+        if cpu is not None:
+            try:
+                cpu_f = float(cpu)
+                threshold = self._resource_thresholds["cpu_max"]
+                if cpu_f > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.RESOURCE_EXHAUSTION,
+                            severity=Severity.CRITICAL
+                            if cpu_f > 0.98
+                            else (Severity.HIGH if cpu_f > 0.95 else Severity.MEDIUM),
+                            description=f"CPU utilisation at {cpu_f:.1%} (threshold={threshold:.1%})",
+                            confidence=min(0.98, 0.6 + cpu_f * 0.3),
+                            metrics_snapshot={
+                                "metric": "cpu_utilization",
+                                "value": cpu_f,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Reduce load or scale out; consider offloading "
+                            "sessions to neighbouring elements",
+                        )
+                    )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Non-numeric cpu_utilization for element %s", reading.element_id
+                )
+
+        # Memory utilisation
+        mem = res.get("memory_utilization")
+        if mem is not None:
+            try:
+                mem_f = float(mem)
+                threshold = self._resource_thresholds["memory_max"]
+                if mem_f > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.RESOURCE_EXHAUSTION,
+                            severity=Severity.HIGH if mem_f > 0.95 else Severity.MEDIUM,
+                            description=f"Memory utilisation at {mem_f:.1%} (threshold={threshold:.1%})",
+                            confidence=min(0.95, 0.6 + mem_f * 0.3),
+                            metrics_snapshot={
+                                "metric": "memory_utilization",
+                                "value": mem_f,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Free session buffers or terminate idle bearers; "
+                            "investigate memory leaks",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        # Temperature
+        temp = res.get("temperature_c")
+        if temp is not None:
+            try:
+                temp_f = float(temp)
+                threshold = self._resource_thresholds["temperature_max"]
+                if temp_f > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.RESOURCE_EXHAUSTION,
+                            severity=Severity.CRITICAL
+                            if temp_f > 85.0
+                            else (Severity.HIGH if temp_f > 75.0 else Severity.MEDIUM),
+                            description=f"Temperature at {temp_f:.1f}°C (threshold={threshold}°C)",
+                            confidence=min(0.95, 0.5 + 0.4 * (temp_f / 100.0)),
+                            metrics_snapshot={
+                                "metric": "temperature_c",
+                                "value": temp_f,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Activate thermal mitigation; reduce processing "
+                            "load or activate cooling redundancy",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        # GTP-U tunnel utilisation
+        gtpu_count = res.get("gtpu_tunnel_count")
+        gtpu_max = res.get("gtpu_tunnel_max")
+        if gtpu_count is not None and gtpu_max is not None:
+            try:
+                gc = int(gtpu_count)
+                gm = int(gtpu_max)
+                if gm > 0:
+                    util = gc / gm
+                    threshold = self._resource_thresholds["gtpu_tunnel_util_max"]
+                    if util > threshold:
+                        anomalies.append(
+                            Anomaly(
+                                element_id=reading.element_id,
+                                anomaly_type=AnomalyType.RESOURCE_EXHAUSTION,
+                                severity=Severity.HIGH
+                                if util > 0.99
+                                else Severity.MEDIUM,
+                                description=(
+                                    f"GTP-U tunnel utilisation at {util:.1%} "
+                                    f"({gc}/{gm} tunnels)"
+                                ),
+                                confidence=min(0.95, 0.6 + util * 0.3),
+                                metrics_snapshot={
+                                    "metric": "gtpu_tunnel_utilization",
+                                    "current": gc,
+                                    "max": gm,
+                                    "ratio": util,
+                                },
+                                suggested_action="Activate session management policies; "
+                                "consider load-balancing to adjacent elements",
+                            )
+                        )
+            except (ValueError, TypeError):
+                pass
+
+        logger.debug(
+            "Resource anomaly detection for %s: %d anomalies found",
+            reading.element_id,
+            len(anomalies),
+        )
+        return anomalies
+
+    # ---- Handover -------------------------------------------------------------
+
+    def detect_handover_anomalies(self, reading: TelemetryReading) -> list[Anomaly]:
+        """Detect handover-related anomalies.
+
+        Checks:
+        - Handover rate exceeding limit
+        - Reselection failure rate
+        - Handover success rate below minimum
+        """
+        anomalies: list[Anomaly] = []
+        rm = reading.radio_metrics  # handover metrics are often in radio layer
+
+        if not rm:
+            # Also check bearer_metrics as some deployments place HO stats there
+            rm = reading.bearer_metrics
+        if not rm:
+            return anomalies
+
+        # Handover rate
+        ho_rate = rm.get("ho_rate_per_sec")
+        if ho_rate is not None:
+            try:
+                hr = float(ho_rate)
+                threshold = self._handover_thresholds["ho_rate_max"]
+                if hr > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.HANDOVER_FAILURE,
+                            severity=Severity.HIGH if hr > 60.0 else Severity.MEDIUM,
+                            description=(
+                                f"Elevated handover rate: {hr:.1f} HO/s "
+                                f"(threshold={threshold} HO/s) – possible ping-pong"
+                            ),
+                            confidence=min(0.95, 0.5 + hr / (threshold * 3)),
+                            metrics_snapshot={
+                                "metric": "ho_rate_per_sec",
+                                "value": hr,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Adjust handover hysteresis and time-to-trigger "
+                            "parameters to reduce ping-pong effect",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        # Reselection failure rate
+        resel_fail_rate = rm.get("reselection_failure_rate")
+        if resel_fail_rate is not None:
+            try:
+                rfr = float(resel_fail_rate)
+                threshold = self._handover_thresholds["reselection_failure_rate"]
+                if rfr > threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.HANDOVER_FAILURE,
+                            severity=Severity.HIGH if rfr > 0.30 else Severity.MEDIUM,
+                            description=(
+                                f"High reselection failure rate: {rfr:.4f} "
+                                f"(threshold={threshold:.4f})"
+                            ),
+                            confidence=min(0.90, 0.5 + rfr * 2),
+                            metrics_snapshot={
+                                "metric": "reselection_failure_rate",
+                                "value": rfr,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Review cell reselection offsets and neighbour "
+                            "relation configuration",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        # Handover success rate
+        ho_success_rate = rm.get("ho_success_rate")
+        if ho_success_rate is not None:
+            try:
+                hsr = float(ho_success_rate)
+                threshold = self._handover_thresholds["ho_success_rate_min"]
+                if hsr < threshold:
+                    anomalies.append(
+                        Anomaly(
+                            element_id=reading.element_id,
+                            anomaly_type=AnomalyType.HANDOVER_FAILURE,
+                            severity=Severity.CRITICAL if hsr < 0.70 else Severity.HIGH,
+                            description=(
+                                f"Low handover success rate: {hsr:.4f} "
+                                f"(minimum={threshold:.4f})"
+                            ),
+                            confidence=min(0.95, 0.5 + (1.0 - hsr) * 0.5),
+                            metrics_snapshot={
+                                "metric": "ho_success_rate",
+                                "value": hsr,
+                                "threshold": threshold,
+                            },
+                            suggested_action="Investigate radio link failure patterns; "
+                            "tune A3 offset and time-to-trigger",
+                        )
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        logger.debug(
+            "Handover anomaly detection for %s: %d anomalies found",
+            reading.element_id,
+            len(anomalies),
+        )
+        return anomalies
+
+    # ---- Helpers --------------------------------------------------------------
+
+    @staticmethod
+    def _radio_severity(metric_key: str, value: float, threshold: float) -> Severity:
+        """Determine severity based on how far a radio metric exceeds its threshold."""
+        ratio = abs(value - threshold) / abs(threshold) if threshold != 0 else 0
+        if ratio > 0.20:
+            return Severity.CRITICAL
+        if ratio > 0.10:
+            return Severity.HIGH
+        if ratio > 0.05:
+            return Severity.MEDIUM
+        return Severity.LOW
+
+    @staticmethod
+    def _radio_confidence(metric_key: str, value: float, threshold: float) -> float:
+        """Compute confidence score for a radio anomaly detection."""
+        if threshold == 0:
+            return 0.5
+        deviation = abs(value - threshold) / abs(threshold)
+        return min(0.95, 0.5 + deviation * 2.0)
+
+    @staticmethod
+    def _bearer_severity(metric_key: str, value: float) -> Severity:
+        """Determine severity for bearer anomaly."""
+        if value > 0.20:
+            return Severity.CRITICAL
+        if value > 0.10:
+            return Severity.HIGH
+        return Severity.MEDIUM
+
+    @staticmethod
+    def _compute_simple_trend(values: np.ndarray) -> float:
+        """Compute simple linear trend (slope) from an array of values.
+
+        Returns:
+            Slope in units per sample. Negative = downward trend.
+        """
+        n = len(values)
+        if n < 2:
+            return 0.0
+        x = np.arange(n, dtype=np.float64)
+        try:
+            slope = float(np.polyfit(x, values, 1)[0])
+        except (np.linalg.LinAlgError, ValueError):
+            slope = 0.0
+        return slope
+
+
+# ---------------------------------------------------------------------------
+# RCA Engine
+# ---------------------------------------------------------------------------
+
+
+class RCAEngine:
+    """Root Cause Analysis engine that runs multiple anomaly detectors and
+    cross-correlates the results against historical patterns.
+
+    The engine maintains a sliding window of recent telemetry readings per
+    network element, enabling trend computation and temporal correlation.
+
+    Args:
+        history_window: Maximum number of readings to retain per element.
+    """
+
+    def __init__(self, history_window: int = 100) -> None:
+        self._history_window = history_window
+        self._history: dict[str, list[TelemetryReading]] = defaultdict(list)
+        self._detector = AnomalyDetector()
+        logger.info("RCAEngine initialised with history_window=%d", history_window)
+
+    def analyze(self, reading: TelemetryReading) -> list[Anomaly]:
+        """Run full RCA on a single telemetry reading.
+
+        1. Update historical buffer.
+        2. Run all anomaly detectors.
+        3. Cross-correlate results.
+        4. Return deduplicated, enriched anomaly list.
+
+        Args:
+            reading: Fresh telemetry reading from Kafka.
+
+        Returns:
+            List of correlated anomalies, sorted by severity descending.
+        """
+        logger.info(
+            "Running RCA for element %s (%s) at ts=%.3f",
+            reading.element_id,
+            reading.element_label,
+            reading.timestamp,
+        )
+
+        # Step 1 – update history
+        self._update_history(reading)
+
+        # Step 2 – run all detectors
+        all_anomalies: list[Anomaly] = []
+        all_anomalies.extend(self._detector.detect_radio_anomalies(reading))
+        all_anomalies.extend(self._detector.detect_bearer_anomalies(reading))
+        all_anomalies.extend(self._detector.detect_resource_anomalies(reading))
+        all_anomalies.extend(self._detector.detect_handover_anomalies(reading))
+
+        if not all_anomalies:
+            logger.debug("No anomalies detected for element %s", reading.element_id)
+            return []
+
+        # Step 3 – cross-correlate
+        correlated = self.correlate_anomalies(all_anomalies)
+
+        # Step 4 – enrich with trend data
+        trends = self._compute_trends(reading.element_id)
+        for anomaly in correlated:
+            anomaly.metrics_snapshot["trends"] = trends
+
+        # Sort by severity
+        correlated.sort(key=lambda a: self._severity_order(a.severity), reverse=True)
+
+        logger.info(
+            "RCA complete for %s: %d raw anomalies → %d correlated anomalies",
+            reading.element_id,
+            len(all_anomalies),
+            len(correlated),
+        )
+        return correlated
+
+    def correlate_anomalies(self, anomalies: list[Anomaly]) -> list[Anomaly]:
+        """Cross-correlate anomalies to identify root causes and suppress duplicates.
+
+        Strategy:
+        - Group anomalies by ``element_id``.
+        - Within each group, score inter-anomaly relationships.
+        - If resource exhaustion + radio degradation co-occur, resource
+          exhaustion is likely the root cause (elevated severity).
+        - Deduplicate anomalies of the same type targeting the same element.
+
+        Args:
+            anomalies: Raw anomalies from individual detectors.
+
+        Returns:
+            Correlated anomaly list with root-cause annotations.
+        """
+        if not anomalies:
+            return []
+
+        # Group by element
+        grouped: dict[str, list[Anomaly]] = defaultdict(list)
+        for a in anomalies:
+            grouped[a.element_id].append(a)
+
+        correlated: list[Anomaly] = []
+
+        for element_id, element_anomalies in grouped.items():
+            logger.debug(
+                "Correlating %d anomalies for element %s",
+                len(element_anomalies),
+                element_id,
+            )
+
+            # Deduplicate by anomaly_type
+            seen_types: set[AnomalyType] = set()
+            unique: list[Anomaly] = []
+            for a in element_anomalies:
+                if a.anomaly_type not in seen_types:
+                    seen_types.add(a.anomaly_type)
+                    unique.append(a)
+                else:
+                    logger.debug(
+                        "Deduplicating %s anomaly for %s (duplicate)",
+                        a.anomaly_type.value,
+                        element_id,
+                    )
+
+            # Cross-correlation: check for causal chains
+            type_set = {a.anomaly_type for a in unique}
+            self._apply_causal_correlation(unique, type_set)
+
+            correlated.extend(unique)
+
+        return correlated
+
+    def _apply_causal_correlation(
+        self,
+        anomalies: list[Anomaly],
+        type_set: set[AnomalyType],
+    ) -> None:
+        """Apply causal correlation heuristics to annotate anomalies.
+
+        Modifies anomalies in-place by adjusting severity and description
+        when causal relationships are identified.
+        """
+        # Resource exhaustion → radio degradation (overloaded eNB can't
+        # maintain radio performance)
+        if (
+            AnomalyType.RESOURCE_EXHAUSTION in type_set
+            and AnomalyType.RADIO_DEGRADATION in type_set
+        ):
+            for a in anomalies:
+                if a.anomaly_type == AnomalyType.RADIO_DEGRADATION:
+                    a.description += (
+                        " [Possible secondary effect of resource exhaustion]"
+                    )
+                    a.confidence = max(0.0, a.confidence - 0.15)
+                    if a.severity == Severity.HIGH:
+                        a.severity = Severity.MEDIUM
+                    logger.debug(
+                        "Downgraded radio degradation for %s (likely resource-induced)",
+                        a.element_id,
+                    )
+
+        # Handover failure + radio degradation → interference likely
+        if (
+            AnomalyType.HANDOVER_FAILURE in type_set
+            and AnomalyType.RADIO_DEGRADATION in type_set
+            and AnomalyType.INTERFERENCE not in type_set
+        ):
+            # Suggest interference as a latent cause
+            ho_anomaly = next(
+                (
+                    a
+                    for a in anomalies
+                    if a.anomaly_type == AnomalyType.HANDOVER_FAILURE
+                ),
+                None,
+            )
+            if ho_anomaly is not None:
+                ho_anomaly.description += " [Latent cause: possible interference]"
+                ho_anomaly.suggested_action = (
+                    "Scan for interference; adjust cell reselection offset and "
+                    "A3 offset parameters"
+                )
+                logger.debug(
+                    "Annotated handover failure with interference hypothesis for %s",
+                    ho_anomaly.element_id,
+                )
+
+        # Signalling storm inference from high bearer failures + handover failures
+        if (
+            AnomalyType.BEARER_FAILURE in type_set
+            and AnomalyType.HANDOVER_FAILURE in type_set
+        ):
+            bearer = next(
+                (a for a in anomalies if a.anomaly_type == AnomalyType.BEARER_FAILURE),
+                None,
+            )
+            if (
+                bearer is not None
+                and bearer.metrics_snapshot.get("packet_loss_rate", 0) > 0.03
+            ):
+                anomalies.append(
+                    Anomaly(
+                        element_id=bearer.element_id,
+                        anomaly_type=AnomalyType.SIGNALING_STORM,
+                        severity=Severity.HIGH,
+                        description=(
+                            "Signalling storm inferred from concurrent bearer failures "
+                            "and handover failures"
+                        ),
+                        confidence=0.6,
+                        metrics_snapshot={
+                            "inferred": True,
+                            "source_anomalies": [
+                                a.anomaly_type.value for a in anomalies
+                            ],
+                        },
+                        suggested_action="Activate signalling rate limiting; investigate "
+                        "potential attack or misconfiguration",
+                    )
+                )
+
+    def _update_history(self, reading: TelemetryReading) -> None:
+        """Append reading to the element history buffer, enforcing the window limit."""
+        self._history[reading.element_id].append(reading)
+        # Trim to window size (FIFO)
+        if len(self._history[reading.element_id]) > self._history_window:
+            self._history[reading.element_id] = self._history[reading.element_id][
+                -self._history_window :
+            ]
+
+    def _compute_trends(self, element_id: str) -> dict[str, Any]:
+        """Compute moving averages and linear trends for key metrics.
+
+        Returns:
+            Dictionary with metric names as keys and trend data as values:
+            ``{"rsrp": {"mean": float, "std": float, "trend": float}, ...}``
+        """
+        history = self._history.get(element_id, [])
+        if len(history) < 3:
+            return {"status": "insufficient_data", "count": len(history)}
+
+        trends: dict[str, Any] = {}
+
+        # Extract numeric radio metrics
+        metric_keys = ["rsrp", "rsrq", "sinr", "rssi"]
+        for key in metric_keys:
+            values: list[float] = []
+            for r in history:
+                v = r.radio_metrics.get(key)
+                if v is not None:
+                    try:
+                        values.append(float(v))
+                    except (ValueError, TypeError):
+                        continue
+            if len(values) >= 3:
+                arr = np.array(values, dtype=np.float64)
+                trend_slope = AnomalyDetector._compute_simple_trend(arr)
+                trends[key] = {
+                    "mean": float(np.mean(arr)),
+                    "std": float(np.std(arr)),
+                    "trend": trend_slope,
+                    "samples": len(values),
+                }
+
+        # Extract bearer metrics
+        bearer_keys = ["packet_loss_rate", "throughput_bps", "rtt_ms"]
+        for key in bearer_keys:
+            values_b: list[float] = []
+            for r in history:
+                v = r.bearer_metrics.get(key)
+                if v is not None:
+                    try:
+                        values_b.append(float(v))
+                    except (ValueError, TypeError):
+                        continue
+            if len(values_b) >= 3:
+                arr_b = np.array(values_b, dtype=np.float64)
+                trends[key] = {
+                    "mean": float(np.mean(arr_b)),
+                    "std": float(np.std(arr_b)),
+                    "trend": float(AnomalyDetector._compute_simple_trend(arr_b)),
+                    "samples": len(values_b),
+                }
+
+        return trends
+
+    @staticmethod
+    def _severity_order(severity: Severity) -> int:
+        """Map severity to numeric priority for sorting."""
+        order = {
+            Severity.LOW: 0,
+            Severity.MEDIUM: 1,
+            Severity.HIGH: 2,
+            Severity.CRITICAL: 3,
+        }
+        return order.get(severity, 0)
+
+
+# ---------------------------------------------------------------------------
+# Kafka Telemetry Consumer
+# ---------------------------------------------------------------------------
+
+
+class KafkaTelemetryConsumer:
+    """Consumes Osmocom telemetry readings from a Kafka topic.
+
+    This consumer deserialises JSON-encoded telemetry messages into
+    :class:`TelemetryReading` dataclass instances.
+
+    Args:
+        bootstrap_servers: Comma-separated list of Kafka broker addresses.
+        topic:              Kafka topic to consume from.
+        group_id:           Consumer group ID for offset management.
+
+    Note:
+        The actual Kafka client is lazily created to avoid import-time
+        failures when Kafka libraries are not installed. A stub consumer
+        is used in simulation / unit-test mode.
+    """
+
+    def __init__(
+        self,
+        bootstrap_servers: str,
+        topic: str,
+        group_id: str,
+    ) -> None:
+        self._bootstrap_servers = bootstrap_servers
+        self._topic = topic
+        self._group_id = group_id
+        self._consumer = None
+        self._use_stub = False
+
+        try:
+            import confluent_kafka  # type: ignore[import-untyped]
+
+            self._consumer = confluent_kafka.Consumer(
+                {
+                    "bootstrap.servers": bootstrap_servers,
+                    "group.id": group_id,
+                    "auto.offset.reset": "latest",
+                    "enable.auto.commit": True,
+                }
+            )
+            self._consumer.subscribe([topic])
+            logger.info(
+                "KafkaTelemetryConsumer connected to %s, topic=%s, group=%s",
+                bootstrap_servers,
+                topic,
+                group_id,
+            )
+        except ImportError:
+            logger.warning(
+                "confluent-kafka not installed; using stub consumer for simulation"
+            )
+            self._use_stub = True
+            self._stub_messages: list[bytes] = []
+
+    def consume(self, timeout_ms: int = 1000) -> list[TelemetryReading]:
+        """Poll Kafka for new telemetry messages.
+
+        Args:
+            timeout_ms: Maximum time to wait for messages (milliseconds).
+
+        Returns:
+            List of deserialized :class:`TelemetryReading` instances.
+        """
+        if self._use_stub:
+            return self._consume_stub()
+
+        readings: list[TelemetryReading] = []
+
+        try:
+            msg = self._consumer.poll(timeout=timeout_ms / 1000.0)  # type: ignore[union-attr]
+            if msg is None:
+                return readings
+            if msg.error():
+                logger.error("Kafka consume error: %s", msg.error())
+                return readings
+
+            reading = self._deserialize(msg.value())
+            if reading is not None:
+                readings.append(reading)
+
+            # Drain remaining messages in the buffer
+            while True:
+                msg_inner = self._consumer.poll(timeout=0.05)  # type: ignore[union-attr]
+                if msg_inner is None:
+                    break
+                if msg_inner.error():
+                    logger.error("Kafka inner poll error: %s", msg_inner.error())
+                    break
+                reading_inner = self._deserialize(msg_inner.value())
+                if reading_inner is not None:
+                    readings.append(reading_inner)
+
+        except Exception as exc:
+            logger.error("Kafka consume exception: %s", exc, exc_info=True)
+
+        return readings
+
+    def _consume_stub(self) -> list[TelemetryReading]:
+        """Stub consumer for simulation environments without Kafka."""
+        return []
+
+    def _deserialize(self, data: bytes) -> TelemetryReading | None:
+        """Deserialize raw Kafka message bytes into a TelemetryReading.
+
+        Expected JSON schema:
+        ``{
+            "element_id": str,
+            "element_label": str,
+            "state": str,
+            "radio_metrics": {...},
+            "bearer_metrics": {...},
+            "resource_metrics": {...},
+            "timestamp": float
+        }``
+        """
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.error("Failed to decode Kafka message: %s", exc)
+            return None
+
+        try:
+            reading = TelemetryReading(
+                element_id=str(payload.get("element_id", "unknown")),
+                element_label=str(payload.get("element_label", "unknown")),
+                state=str(payload.get("state", "unknown")),
+                radio_metrics=payload.get("radio_metrics", {}),
+                bearer_metrics=payload.get("bearer_metrics", {}),
+                resource_metrics=payload.get("resource_metrics", {}),
+                timestamp=float(payload.get("timestamp", time.time())),
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error("Failed to parse telemetry payload: %s", exc)
+            return None
+
+        return reading
+
+    def close(self) -> None:
+        """Close the Kafka consumer and release resources."""
+        if self._consumer and not self._use_stub:
+            try:
+                self._consumer.close()  # type: ignore[union-attr]
+                logger.info("Kafka consumer closed")
+            except Exception as exc:
+                logger.error("Error closing Kafka consumer: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# RCA Pipeline (Top-level Orchestrator)
+# ---------------------------------------------------------------------------
+
+
+class RCAPipeline:
+    """End-to-end pipeline that consumes Kafka telemetry and produces
+    correlated anomaly reports.
+
+    This is the primary entry-point for the RCA subsystem.
+
+    Args:
+        kafka_config: Configuration passed to :class:`KafkaTelemetryConsumer`.
+                      Required keys: ``bootstrap_servers``, ``topic``, ``group_id``.
+        rca_config:   Optional configuration for :class:`AnomalyDetector` thresholds.
+    """
+
+    def __init__(
+        self,
+        kafka_config: dict[str, Any],
+        rca_config: dict[str, Any] | None = None,
+    ) -> None:
+        self._kafka_config = kafka_config
+        self._rca_config = rca_config
+
+        self._consumer = KafkaTelemetryConsumer(
+            bootstrap_servers=kafka_config.get("bootstrap_servers", "localhost:9092"),
+            topic=kafka_config.get("topic", "osmocom-telemetry"),
+            group_id=kafka_config.get("group_id", "rca-pipeline-group"),
+        )
+
+        self._engine = RCAEngine()
+        self._detector = AnomalyDetector(config=rca_config)
+        self._engine._detector = self._detector  # Inject configured detector
+
+        logger.info("RCAPipeline initialised")
+
+    def run_single(self) -> list[Anomaly]:
+        """Execute a single pipeline cycle.
+
+        1. Poll Kafka for a batch of telemetry readings.
+        2. Run the RCA engine on each reading.
+        3. Aggregate and return all detected anomalies.
+
+        Returns:
+            List of correlated anomalies (may be empty).
+        """
+        readings = self._consumer.consume(timeout_ms=1000)
+
+        if not readings:
+            logger.debug("No telemetry readings in this poll cycle")
+            return []
+
+        all_anomalies: list[Anomaly] = []
+        for reading in readings:
+            anomalies = self._engine.analyze(reading)
+            all_anomalies.extend(anomalies)
+
+        logger.info(
+            "RCAPipeline single run: %d readings → %d anomalies",
+            len(readings),
+            len(all_anomalies),
+        )
+        return all_anomalies
+
+    def run_continuous(
+        self,
+        callback: Callable[[list[Anomaly]], None],
+        poll_interval: float = 1.0,
+    ) -> None:
+        """Run the pipeline continuously in a blocking loop.
+
+        Each iteration:
+        1. Poll Kafka for telemetry.
+        2. Run RCA engine.
+        3. Invoke ``callback`` with the detected anomalies.
+
+        Args:
+            callback:      Function invoked with the anomaly list on each cycle.
+            poll_interval: Seconds to sleep between poll cycles.
+
+        Note:
+            This method blocks indefinitely. Use ``KeyboardInterrupt`` or
+            a threading.Event to stop.
+        """
+        logger.info(
+            "RCAPipeline starting continuous mode (poll_interval=%.2fs)", poll_interval
+        )
+        cycle = 0
+
+        try:
+            while True:
+                cycle += 1
+                logger.debug("RCAPipeline cycle %d starting", cycle)
+
+                try:
+                    anomalies = self.run_single()
+                    callback(anomalies)
+                except Exception as exc:
+                    logger.error(
+                        "RCAPipeline cycle %d error: %s", cycle, exc, exc_info=True
+                    )
+
+                time.sleep(poll_interval)
+
+        except KeyboardInterrupt:
+            logger.info("RCAPipeline continuous mode stopped (signal)")
+        finally:
+            self._consumer.close()
+
+    def close(self) -> None:
+        """Release all resources held by the pipeline."""
+        self._consumer.close()
+        logger.info("RCAPipeline closed")
+
+
+# ---------------------------------------------------------------------------
+# Module entry-point for direct execution
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """Run the RCA pipeline as a standalone process for testing / simulation."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    pipeline = RCAPipeline(
+        kafka_config={
+            "bootstrap_servers": "172.29.0.10:9092",
+            "topic": "osmocom-telemetry",
+            "group_id": "rca-pipeline-group",
+        },
+    )
+
+    def print_anomalies(anomalies: list[Anomaly]) -> None:
+        for a in anomalies:
+            print(
+                f"[{a.severity.value.upper()}] {a.anomaly_type.value}: "
+                f"{a.description} (confidence={a.confidence:.2f})"
+            )
+        if anomalies:
+            print(f"--- {len(anomalies)} anomalies detected ---")
+        else:
+            print("--- No anomalies ---")
+
+    pipeline.run_continuous(callback=print_anomalies, poll_interval=2.0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'dsf_server'
+    static_configs:
+      - targets: ['dsf-server:8000']
+
+  - job_name: 'llm_agent'
+    static_configs:
+      - targets: ['llm-agent:8001']
+

@@ -1,0 +1,42 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+      - name: Generate mTLS Certificates
+        run: bash ./infra/scripts/bootstrap.sh
+          
+      - name: Start Docker Environment
+        run: docker compose up -d --build
+        
+      - name: Wait for services to be ready
+        run: sleep 15
+        
+      - name: Run Tests
+        run: |
+          docker cp test_intent.py 6gdi-llm-agent:/app/test_intent.py
+          docker exec 6gdi-llm-agent python /app/test_intent.py
+        
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
