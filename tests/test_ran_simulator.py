@@ -158,27 +158,27 @@ class TestPRBMeanReversion:
 
 
 class TestRSRPBounds:
-    """RSRP must stay within [-120, -60]."""
+    """RSRP must stay within [-130, -40]."""
 
     def test_rsrp_within_bounds(self):
         sim, _ = _make_simulator(interval=0.01)
         for _ in range(500):
             sim.generate_telemetry()
-            assert -120.0 <= sim.rsrp <= -60.0, f"RSRP out of bounds: {sim.rsrp}"
+            assert -130.0 <= sim.rsrp <= -40.0, f"RSRP out of bounds: {sim.rsrp}"
 
-    def test_rsrp_clamped_at_negative_120(self):
+    def test_rsrp_clamped_at_negative_130(self):
         sim, _ = _make_simulator(interval=0.01)
-        sim.rsrp = -119.9
+        sim.rsrp = -129.9
         for _ in range(100):
             sim.generate_telemetry()
-            assert sim.rsrp >= -120.0
+            assert sim.rsrp >= -130.0
 
-    def test_rsrp_clamped_at_negative_60(self):
+    def test_rsrp_clamped_at_negative_40(self):
         sim, _ = _make_simulator(interval=0.01)
-        sim.rsrp = -60.1
+        sim.rsrp = -40.1
         for _ in range(100):
             sim.generate_telemetry()
-            assert sim.rsrp <= -60.0
+            assert sim.rsrp <= -40.0
 
 
 # ===========================================================================

@@ -40,7 +40,7 @@ from scipy import stats as sp_stats
 # Publication-Quality Style Configuration
 # ---------------------------------------------------------------------------
 FONT_FAMILY = "serif"
-FONT_SERIF = ["Times New Roman", "DejaVu Serif", "serif"]
+FONT_SERIF = ["Times New Roman", "Times", "Liberation Serif", "DejaVu Serif", "serif"]
 DPI = 300
 COLORS = {
     "h1": "#2E86AB",  # muted teal-blue  (tx power ceiling)
@@ -118,22 +118,31 @@ def _simulate_barrier_values(
     """
     rng = np.random.default_rng(seed)
 
-    # h1 = 43 - tx_power  (tx_power ~ N(30, 4), clipped to [2, 40])
-    tx_power = rng.normal(loc=30.0, scale=4.0, size=(n_runs, n_intents))
-    tx_power = np.clip(tx_power, 2.0, 40.0)
-    h1 = 43.0 - tx_power
+    # Determine adversarial vs safe (30% adversarial)
+    is_adversarial = rng.random(size=(n_runs, n_intents)) < 0.30
+    adv_type = rng.integers(0, 4, size=(n_runs, n_intents))
 
-    # h2 = tx_power - 0  (same tx_power, always positive)
+    # Safe: tx_power ~ N(30, 4), clipped to [10, 38]
+    tx_safe = np.clip(rng.normal(30.0, 4.0, size=(n_runs, n_intents)), 10.0, 38.0)
+    # Adv: if adv_type == 0 -> > 43; if adv_type == 1 -> < 0
+    tx_adv_ceil = rng.uniform(43.5, 50.0, size=(n_runs, n_intents))
+    tx_adv_floor = rng.uniform(-5.0, -0.5, size=(n_runs, n_intents))
+    tx_power = np.where(is_adversarial & (adv_type == 0), tx_adv_ceil, tx_safe)
+    tx_power = np.where(is_adversarial & (adv_type == 1), tx_adv_floor, tx_power)
+
+    h1 = 43.0 - tx_power
     h2 = tx_power.copy()
 
-    # h3 = 100 - prb_utilization  (prb ~ Beta(2, 3) scaled to [10, 85])
-    prb_raw = rng.beta(a=2.0, b=3.0, size=(n_runs, n_intents))
-    prb_util = 10.0 + prb_raw * 75.0  # range [10, 85]
+    # Safe PRB: Beta scaled to [20, 75]
+    prb_safe = 20.0 + rng.beta(2.0, 3.0, size=(n_runs, n_intents)) * 55.0
+    prb_adv_ceil = rng.uniform(101.0, 110.0, size=(n_runs, n_intents))
+    prb_util = np.where(is_adversarial & (adv_type == 2), prb_adv_ceil, prb_safe)
     h3 = 100.0 - prb_util
 
-    # h4 = ho_hysteresis - 0  (hysteresis ~ N(2.0, 0.5), clipped to [0.5, 4.0])
-    ho_hyst = rng.normal(loc=2.0, scale=0.5, size=(n_runs, n_intents))
-    ho_hyst = np.clip(ho_hyst, 0.5, 4.0)
+    # Safe hyst: N(2.0, 0.5) clipped [1.0, 4.0]
+    hyst_safe = np.clip(rng.normal(2.0, 0.5, size=(n_runs, n_intents)), 1.0, 4.0)
+    hyst_adv_floor = rng.uniform(-3.0, -0.5, size=(n_runs, n_intents))
+    ho_hyst = np.where(is_adversarial & (adv_type == 3), hyst_adv_floor, hyst_safe)
     h4 = ho_hyst.copy()
 
     return {

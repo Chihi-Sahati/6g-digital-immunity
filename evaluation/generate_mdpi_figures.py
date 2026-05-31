@@ -82,6 +82,9 @@ class EvalRANSimulator(RANSimulator):
         self.theta = 0.15
         self.mu = 75.0
         self.sigma = 8.0
+        self.freq_ghz = 3.5
+        self.fspl_penalty = 0.0
+        self.base_rsrp = -70.0
         self.prb_utilization = 30.0
         self.tx_power = 43.0
         self.rsrp = -85.0

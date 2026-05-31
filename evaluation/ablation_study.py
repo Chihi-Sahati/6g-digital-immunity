@@ -80,7 +80,13 @@ import pandas as pd
 plt.rcParams.update(
     {
         "font.family": "serif",
-        "font.serif": ["Times New Roman"],
+        "font.serif": [
+            "Times New Roman",
+            "Times",
+            "Liberation Serif",
+            "DejaVu Serif",
+            "serif",
+        ],
         "axes.labelsize": 12,
         "font.size": 11,
         "legend.fontsize": 9,
@@ -114,7 +120,7 @@ H_MIN = 0.0  # dB   — minimum handover hysteresis
 GAMMA_K = 0.3  # Class-K gain: γ(h) = k · h
 
 # Zeno parameters
-TAU_MIN_MS = 500.0  # Minimum inter-actuation time (ms)
+TAU_MIN_MS = 200.0  # Minimum inter-actuation time (ms)
 COOLDOWN_S = 2.0  # Cooldown duration after Zeno violation (s)
 
 # Simulation parameters
@@ -161,7 +167,7 @@ class GateResult:
     zeno_passed: bool = True
 
 
-def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
+def generate_intent(rng: np.random.Generator, current_time: float) -> Intent:
     """Generate a random LLM intent (safe or adversarial).
 
     Safe intents request parameter values within the feasible region defined
@@ -170,7 +176,7 @@ def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
 
     Args:
         rng: NumPy random generator for reproducibility.
-        idx: Intent index (used for timestamp spacing).
+        current_time: Simulated current time in seconds.
 
     Returns:
         An Intent object with state, desired state, and metadata.
@@ -182,8 +188,7 @@ def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
 
     state = np.array([current_tx, current_hyst, current_prb], dtype=np.float64)
 
-    # Timestamp with realistic inter-arrival spacing (100–2000 ms)
-    timestamp = idx * rng.uniform(0.1, 2.0)
+    timestamp = current_time
 
     # Determine if adversarial (30% chance)
     is_adversarial = rng.random() < ADVERSARIAL_FRACTION
@@ -351,7 +356,7 @@ def gate2_cbf_safety(intent: Intent) -> GateResult:
 
         # For safety filter purposes, we use a relaxed Lyapunov condition:
         # V must not grow uncontrollably (V < large threshold)
-        lyapunov_passed = V < 1000.0  # Reasonable operating region
+        lyapunov_passed = V < 5000.0  # Reasonable operating region
 
         if lyapunov_passed:
             latency = (time.perf_counter() - t_start) * 1000.0 + np.random.uniform(
@@ -554,9 +559,11 @@ def run_dsf_simulation(
     rng = np.random.default_rng(seed)
     result = AblationResult(config_name=config_name, total_intents=n_intents)
     last_actuation_time = -1.0  # No prior actuation
+    current_time = 0.0
 
     for i in range(n_intents):
-        intent = generate_intent(rng, i)
+        current_time += rng.uniform(0.5, 3.0)
+        intent = generate_intent(rng, current_time)
         total_latency = 0.0
         decision = DECISION_ACCEPT
         blocked = False

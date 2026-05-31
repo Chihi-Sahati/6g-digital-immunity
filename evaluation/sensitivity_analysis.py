@@ -68,7 +68,13 @@ from scipy import stats
 plt.rcParams.update(
     {
         "font.family": "serif",
-        "font.serif": ["Times New Roman"],
+        "font.serif": [
+            "Times New Roman",
+            "Times",
+            "Liberation Serif",
+            "DejaVu Serif",
+            "serif",
+        ],
         "axes.labelsize": 12,
         "font.size": 11,
         "legend.fontsize": 9,
@@ -100,7 +106,7 @@ H_MIN = 0.0
 # Nominal default parameters
 DEFAULT_GAMMA_K = 0.3
 DEFAULT_LYAP_ALPHA = 0.1
-DEFAULT_TAU_MIN_MS = 500.0
+DEFAULT_TAU_MIN_MS = 200.0
 
 # Simulation parameters
 N_INTENTS = 500
@@ -134,12 +140,12 @@ class Intent:
     decision: str = ""
 
 
-def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
+def generate_intent(rng: np.random.Generator, current_time: float) -> Intent:
     """Generate a random LLM intent (safe or adversarial).
 
     Args:
         rng: NumPy random generator for reproducibility.
-        idx: Intent index for timestamp computation.
+        current_time: Simulated current time in seconds.
 
     Returns:
         Intent object with randomly sampled state and desired state.
@@ -148,7 +154,7 @@ def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
     current_hyst = rng.uniform(0.5, 6.0)
     current_prb = rng.uniform(10.0, 85.0)
     state = np.array([current_tx, current_hyst, current_prb], dtype=np.float64)
-    timestamp = idx * rng.uniform(0.1, 2.0)
+    timestamp = current_time
     is_adversarial = rng.random() < ADVERSARIAL_FRACTION
     is_malformed = rng.random() < CUE_MALFORM_RATE
 
@@ -156,27 +162,27 @@ def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
         adv_type = rng.integers(0, 4)
         if adv_type == 0:
             desired_tx, desired_prb, desired_hyst = (
-                rng.uniform(42.0, 50.0),
+                P_MAX + rng.uniform(0.1, 1.5),
                 rng.uniform(10.0, 80.0),
                 rng.uniform(0.5, 6.0),
             )
         elif adv_type == 1:
             desired_tx, desired_prb, desired_hyst = (
-                rng.uniform(-5.0, 5.0),
+                P_MIN - rng.uniform(0.1, 1.5),
                 rng.uniform(10.0, 80.0),
                 rng.uniform(0.5, 6.0),
             )
         elif adv_type == 2:
             desired_tx, desired_prb, desired_hyst = (
                 rng.uniform(10.0, 40.0),
-                rng.uniform(92.0, 110.0),
+                PRB_MAX + rng.uniform(0.1, 3.0),
                 rng.uniform(0.5, 6.0),
             )
         else:
             desired_tx, desired_prb, desired_hyst = (
                 rng.uniform(10.0, 40.0),
                 rng.uniform(10.0, 80.0),
-                rng.uniform(-3.0, 0.3),
+                H_MIN - rng.uniform(0.1, 1.0),
             )
     else:
         desired_tx, desired_prb, desired_hyst = (
@@ -393,9 +399,11 @@ def run_sensitivity_sweep(
         total_intents=n_intents,
     )
     last_act_time = -1.0
+    current_time = 0.0
 
     for i in range(n_intents):
-        intent = generate_intent(rng, i)
+        current_time += rng.uniform(0.5, 3.0)
+        intent = generate_intent(rng, current_time)
         total_latency = 0.0
         decision = DECISION_ACCEPT
         blocked = False

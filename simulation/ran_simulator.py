@@ -38,12 +38,17 @@ class RANSimulator:
         self.mu = 75.0  # Long-term mean (congestion)
         self.sigma = 8.0  # Volatility
 
+        self.freq_ghz = float(os.getenv("CARRIER_FREQ_GHZ", "3.5"))
+        # FSPL diff from 3.5 GHz (e.g., 140 GHz adds ~32 dB path loss)
+        self.fspl_penalty = 20 * np.log10(self.freq_ghz / 3.5)
+        self.base_rsrp = -70.0 - self.fspl_penalty
+
         # Internal state variables
         self.prb_utilization = 30.0  # Percentage
         self.tx_power = 43.0  # dBm
-        self.rsrp = -85.0  # dBm
+        self.rsrp = self.base_rsrp - 10.0  # dBm
         self.active_users = 50
-        self.sinr = 20.0  # dB
+        self.sinr = 20.0 - (self.fspl_penalty * 0.5)  # dB
 
         logger.info(
             f"Initializing RAN Simulator (O-U Process). Kafka: {kafka_brokers}, Topic: {self.topic}"
@@ -79,14 +84,14 @@ class RANSimulator:
         self.active_users = max(0, self.active_users)
 
         # RSRP varies slightly due to fading (smaller volatility O-U process)
-        rsrp_mu = -70.0
         self.rsrp += (
-            0.2 * (rsrp_mu - self.rsrp) * dt + 1.5 * np.sqrt(dt) * np.random.randn()
+            0.2 * (self.base_rsrp - self.rsrp) * dt
+            + 1.5 * np.sqrt(dt) * np.random.randn()
         )
-        self.rsrp = max(-120.0, min(-60.0, self.rsrp))
+        self.rsrp = max(-130.0, min(-40.0, self.rsrp))
 
-        # SINR is inversely related to utilization (interference)
-        target_sinr = 25.0 - (self.prb_utilization * 0.15)
+        # SINR is inversely related to utilization (interference) and impacted by path loss
+        target_sinr = 25.0 - (self.prb_utilization * 0.15) - (self.fspl_penalty * 0.5)
         self.sinr += (target_sinr - self.sinr) * 0.2 + np.random.uniform(-0.5, 0.5)
 
     def publish_metric(self, name, value, unit):

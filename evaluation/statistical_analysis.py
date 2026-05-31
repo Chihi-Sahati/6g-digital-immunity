@@ -66,7 +66,13 @@ from scipy import stats as scipy_stats
 plt.rcParams.update(
     {
         "font.family": "serif",
-        "font.serif": ["Times New Roman"],
+        "font.serif": [
+            "Times New Roman",
+            "Times",
+            "Liberation Serif",
+            "DejaVu Serif",
+            "serif",
+        ],
         "axes.labelsize": 12,
         "font.size": 11,
         "legend.fontsize": 9,
@@ -95,12 +101,14 @@ PRB_MAX = 100.0
 H_MIN = 0.0
 
 GAMMA_K = 0.3
-TAU_MIN_MS = 500.0
 LYAP_ALPHA = 0.1
 
-# Experiment parameters
-N_RUNS = 10  # Number of independent runs
-N_INTENTS = 500  # Intents per run
+# Zeno parameters
+TAU_MIN_MS = 200.0  # Minimum inter-actuation time (ms)
+
+# Simulation parameters
+N_RUNS = 50
+N_INTENTS = 1000
 ADVERSARIAL_FRACTION = 0.30
 CUE_MALFORM_RATE = 0.08
 
@@ -145,12 +153,12 @@ class Intent:
     is_malformed: bool
 
 
-def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
+def generate_intent(rng: np.random.Generator, current_time: float) -> Intent:
     """Generate a random LLM intent (safe or adversarial).
 
     Args:
         rng: NumPy random generator.
-        idx: Intent index for timestamp.
+        current_time: Simulated current time in seconds.
 
     Returns:
         Intent with randomly sampled state and desired state.
@@ -159,7 +167,7 @@ def generate_intent(rng: np.random.Generator, idx: int) -> Intent:
     current_hyst = rng.uniform(0.5, 6.0)
     current_prb = rng.uniform(10.0, 85.0)
     state = np.array([current_tx, current_hyst, current_prb], dtype=np.float64)
-    timestamp = idx * rng.uniform(0.1, 2.0)
+    timestamp = current_time
     is_adversarial = rng.random() < ADVERSARIAL_FRACTION
     is_malformed = rng.random() < CUE_MALFORM_RATE
 
@@ -249,7 +257,7 @@ def gate2_cbf(intent: Intent) -> Tuple[str, float, List[float]]:
     if all_passed:
         x_ref = np.array([30.0, 3.0, 50.0], dtype=np.float64)
         V = float(np.sum((desired - x_ref) ** 2))
-        lyapunov_passed = V < 1000.0
+        lyapunov_passed = V < 5000.0
         latency = (time.perf_counter() - t_start) * 1000.0 + np.random.uniform(0.1, 0.5)
         if lyapunov_passed:
             return DECISION_ACCEPT, latency, margins
@@ -323,6 +331,7 @@ class BaselineRunResult:
     acceptance_rate: float = 0.0
     safety_violations: int = 0
     dsf_latency_ms: float = 0.0
+    accepted_count: int = 0
 
 
 def run_single_experiment(
@@ -339,18 +348,23 @@ def run_single_experiment(
         RunResult with all per-run metrics.
     """
     rng = np.random.default_rng(seed)
-    last_act_time = -1.0
 
     if enable_dsf:
         result = RunResult(run_id=run_id)
     else:
-        result = BaselineRunResult(run_id=run_id)
+        result = BaselineRunResult(run_id=run_id, accepted_count=0)
 
+    last_act_time = -1.0
     min_margins_list = []
     latencies_list = []
 
+    current_time = 0.0
+
     for i in range(N_INTENTS):
-        intent = generate_intent(rng, i)
+        # Time progresses forward by 0.5 to 3.0 seconds per intent
+        current_time += rng.uniform(0.5, 3.0)
+        intent = generate_intent(rng, current_time)
+
         total_latency = 0.0
         decision = DECISION_ACCEPT
         blocked = False
